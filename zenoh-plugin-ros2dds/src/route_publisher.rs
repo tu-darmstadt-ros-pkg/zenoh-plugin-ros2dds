@@ -28,6 +28,7 @@ use serde::{Serialize, Serializer};
 use zenoh::{
     key_expr::{keyexpr, OwnedKeyExpr},
     liveliness::LivelinessToken,
+    matching::MatchingListener,
     qos::{CongestionControl, Priority, Reliability},
     sample::Locality,
     Wait,
@@ -84,6 +85,14 @@ pub struct RoutePublisher {
     // the local DDS Reader created to serve the route (i.e. re-publish to zenoh message coming from DDS)
     #[serde(serialize_with = "serialize_atomic_entity_guid")]
     dds_reader: Arc<AtomicDDSEntity>,
+    // the MatchingListener that activates/deactivates the DDS Reader on remote
+    // subscriber (un)matching. Kept here (NOT backgrounded) so it is undeclared
+    // when this RoutePublisher is dropped — otherwise the listener's callback
+    // holds a clone of the zenoh Publisher, forming a reference cycle that keeps
+    // the listener (and the DDS Readers it creates) alive forever, leaking a
+    // Reader per route re-creation and duplicating forwarded messages.
+    #[serde(skip)]
+    _matching_listener: Option<MatchingListener<()>>,
     // the Zenoh Priority for publications
     #[serde(serialize_with = "serialize_priority")]
     priority: Priority,
@@ -109,6 +118,15 @@ pub struct RoutePublisher {
 
 impl Drop for RoutePublisher {
     fn drop(&mut self) {
+        // Undeclare the matching listener FIRST so it can't fire during teardown
+        // and re-create a DDS Reader after we've deactivated it. Dropping the
+        // (non-backgrounded) listener undeclares it and releases its clone of the
+        // zenoh Publisher, breaking the reference cycle.
+        if let Some(listener) = self._matching_listener.take() {
+            if let Err(e) = listener.undeclare().wait() {
+                tracing::debug!("{self}: error undeclaring matching listener: {e}");
+            }
+        }
         self.deactivate_dds_reader();
     }
 }
@@ -221,7 +239,9 @@ impl RoutePublisher {
         // (copy/move all required args for the callback)
         let dds_reader: Arc<AtomicDDSEntity> = Arc::new(DDS_ENTITY_NULL.into());
 
-        publisher
+        // NOTE: this listener is NOT backgrounded — its handle is stored in the
+        // RoutePublisher below so it is undeclared on Drop (see field doc).
+        let matching_listener = publisher
             .matching_listener()
             .callback({
                 let dds_reader = dds_reader.clone();
@@ -256,7 +276,6 @@ impl RoutePublisher {
                     }
                 }
             })
-            .background()
             .await
             .map_err(|e| format!("Failed to listen of matching status changes: {e}",))?;
 
@@ -270,6 +289,7 @@ impl RoutePublisher {
                 cache_size,
             },
             dds_reader,
+            _matching_listener: Some(matching_listener),
             priority,
             _type_info: type_info.clone(),
             _reader_qos: reader_qos,
