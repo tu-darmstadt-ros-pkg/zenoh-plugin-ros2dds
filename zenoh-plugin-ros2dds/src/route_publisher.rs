@@ -85,12 +85,11 @@ pub struct RoutePublisher {
     // the local DDS Reader created to serve the route (i.e. re-publish to zenoh message coming from DDS)
     #[serde(serialize_with = "serialize_atomic_entity_guid")]
     dds_reader: Arc<AtomicDDSEntity>,
-    // the MatchingListener that activates/deactivates the DDS Reader on remote
+    // the MatchingListener activating/deactivating the DDS Reader on remote
     // subscriber (un)matching. Kept here (NOT backgrounded) so it is undeclared
-    // when this RoutePublisher is dropped — otherwise the listener's callback
-    // holds a clone of the zenoh Publisher, forming a reference cycle that keeps
-    // the listener (and the DDS Readers it creates) alive forever, leaking a
-    // Reader per route re-creation and duplicating forwarded messages.
+    // on Drop — otherwise its callback's clone of the zenoh Publisher forms a
+    // reference cycle, leaking a Reader per route re-creation and duplicating
+    // forwarded messages.
     #[serde(skip)]
     _matching_listener: Option<MatchingListener<()>>,
     // the Zenoh Priority for publications
@@ -118,12 +117,12 @@ pub struct RoutePublisher {
 
 impl Drop for RoutePublisher {
     fn drop(&mut self) {
-        // Undeclare the matching listener FIRST so it can't fire during teardown
-        // and re-create a DDS Reader after we've deactivated it. Dropping the
-        // (non-backgrounded) listener undeclares it and releases its clone of the
-        // zenoh Publisher, breaking the reference cycle.
+        // Undeclare the matching listener FIRST, before deactivating the Reader:
+        // this releases its clone of the zenoh Publisher (breaking the reference
+        // cycle), and `wait_callbacks()` blocks until any in-flight callback
+        // returns so it can't re-create a DDS Reader after we've torn it down.
         if let Some(listener) = self._matching_listener.take() {
-            if let Err(e) = listener.undeclare().wait() {
+            if let Err(e) = listener.undeclare().wait_callbacks().wait() {
                 tracing::debug!("{self}: error undeclaring matching listener: {e}");
             }
         }
@@ -239,8 +238,8 @@ impl RoutePublisher {
         // (copy/move all required args for the callback)
         let dds_reader: Arc<AtomicDDSEntity> = Arc::new(DDS_ENTITY_NULL.into());
 
-        // NOTE: this listener is NOT backgrounded — its handle is stored in the
-        // RoutePublisher below so it is undeclared on Drop (see field doc).
+        // NOT backgrounded: the handle is stored in the RoutePublisher below so
+        // it is undeclared on Drop (see field doc).
         let matching_listener = publisher
             .matching_listener()
             .callback({
