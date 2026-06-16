@@ -30,6 +30,7 @@ use zenoh::{
     internal::buffers::{Buffer, ZBuf, ZSlice},
     key_expr::{keyexpr, OwnedKeyExpr},
     liveliness::LivelinessToken,
+    matching::MatchingListener,
     query::{Querier, Reply},
     sample::Locality,
     Wait,
@@ -74,6 +75,17 @@ pub struct RouteServiceCli {
     // the local DDS Writer sending replies to the client
     #[serde(serialize_with = "serialize_atomic_entity_guid")]
     rep_writer: Arc<AtomicDDSEntity>,
+    // the MatchingListener activating/deactivating the DDS Reader/Writer on remote
+    // queryable (un)matching. Kept here (NOT backgrounded) so it is undeclared
+    // on Drop — otherwise its callback's clones of the zenoh Querier + DDS entity
+    // handles leak and can flip a live route's request/reply entities.
+    // (Same bug as RoutePublisher.)
+    #[serde(skip)]
+    _matching_listener: Option<MatchingListener<()>>,
+    // TypeInfo for DDS entity creation (if available); retained so the route can
+    // re-activate its DDS entities when a remote server reconnects (see add_remote_route)
+    #[serde(skip)]
+    _type_info: Option<Arc<TypeInfo>>,
     // a liveliness token associated to this route, for announcement to other plugins
     #[serde(skip)]
     liveliness_token: Option<LivelinessToken>,
@@ -85,6 +97,15 @@ pub struct RouteServiceCli {
 
 impl Drop for RouteServiceCli {
     fn drop(&mut self) {
+        // Undeclare the matching listener FIRST, before deactivating the DDS
+        // entities: this releases its clones of the zenoh Querier + DDS handles
+        // (breaking the reference cycle), and `wait_callbacks()` blocks until any
+        // in-flight callback returns so it can't re-activate after teardown.
+        if let Some(listener) = self._matching_listener.take() {
+            if let Err(e) = listener.undeclare().wait_callbacks().wait() {
+                tracing::debug!("{self}: error undeclaring matching listener: {e}");
+            }
+        }
         self.deactivate();
     }
 }
@@ -131,7 +152,9 @@ impl RouteServiceCli {
         let rep_writer: Arc<AtomicDDSEntity> = Arc::new(DDS_ENTITY_NULL.into());
         let req_reader: Arc<AtomicDDSEntity> = Arc::new(DDS_ENTITY_NULL.into());
 
-        zenoh_querier
+        // NOT backgrounded: the handle is stored in the RouteServiceCli below so
+        // it is undeclared on Drop (see field doc).
+        let matching_listener = zenoh_querier
             .matching_listener()
             .callback({
                 let rep_writer = rep_writer.clone();
@@ -140,6 +163,7 @@ impl RouteServiceCli {
                 let ros2_type = ros2_type.clone();
                 let context = context.clone();
                 let zquerier = zenoh_querier.clone();
+                let type_info = type_info.clone();
 
                 move |status| {
                         tracing::debug!("{route_id} MatchingStatus changed: {status:?}");
@@ -166,7 +190,6 @@ impl RouteServiceCli {
                         }
                 }
             })
-            .background()
             .await
             .map_err(|e| format!("Route Service Client (ROS:{ros2_name} <-> Zenoh:{zenoh_key_expr}): failed to listen of matching status changes: {e}",))?;
 
@@ -179,6 +202,8 @@ impl RouteServiceCli {
             queries_timeout,
             rep_writer,
             req_reader,
+            _matching_listener: Some(matching_listener),
+            _type_info: type_info,
             liveliness_token: None,
             remote_routes: HashSet::new(),
             local_nodes: HashSet::new(),
@@ -234,6 +259,34 @@ impl RouteServiceCli {
         self.remote_routes
             .insert(format!("{zenoh_id}:{zenoh_key_expr}"));
         tracing::debug!("{self}: now serving remote routes {:?}", self.remote_routes);
+
+        // A remote server reconnecting (e.g. after a link flap that pruned the
+        // old session and deactivated us) arrives here. The matching listener
+        // only (re)activates on a `matching:false -> true` transition, which may
+        // not fire on reconnect — so if we now match a queryable but the DDS
+        // entities are inactive, (re)activate them. Otherwise the route stays
+        // discoverable but with a dead request/reply path ("listed but dead").
+        if self.req_reader.load(Ordering::Relaxed) == DDS_ENTITY_NULL {
+            match self._zenoh_querier.matching_status().wait() {
+                Ok(status) if status.matching() => {
+                    let route_id = self.to_string();
+                    if let Err(e) = activate(
+                        &self.rep_writer,
+                        &self.req_reader,
+                        &self.ros2_name,
+                        &self.ros2_type,
+                        &route_id,
+                        &self.context,
+                        &self._type_info,
+                        &self._zenoh_querier,
+                    ) {
+                        tracing::error!("{self}: failed to re-activate DDS entities: {e}");
+                    }
+                }
+                Ok(_) => {}
+                Err(e) => tracing::debug!("{self}: could not query matching status: {e}"),
+            }
+        }
     }
 
     #[inline]
@@ -245,6 +298,23 @@ impl RouteServiceCli {
         if self.remote_routes.is_empty() {
             self.deactivate();
         }
+    }
+
+    /// Remove all remote_routes entries for a departed bridge (prefix
+    /// "<zenoh_id>:"), deactivating the DDS entities if this leaves the route
+    /// serving no remote route. Returns whether any entry was removed.
+    #[inline]
+    pub fn prune_remote_routes_with_prefix(&mut self, prefix: &str) -> bool {
+        let before = self.remote_routes.len();
+        self.remote_routes.retain(|r| !r.starts_with(prefix));
+        if self.remote_routes.len() == before {
+            return false;
+        }
+        tracing::debug!("{self}: now serving remote routes {:?}", self.remote_routes);
+        if self.remote_routes.is_empty() {
+            self.deactivate();
+        }
+        true
     }
 
     #[inline]

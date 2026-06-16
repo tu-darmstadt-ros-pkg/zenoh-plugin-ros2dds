@@ -245,6 +245,27 @@ impl RouteActionCli {
         tracing::debug!("{self} now serving remote routes {:?}", self.remote_routes);
     }
 
+    /// Remove all remote_routes entries for a departed bridge (prefix
+    /// "<zenoh_id>:") across this action's sub-routes and its own set.
+    /// Returns whether any entry was removed.
+    #[inline]
+    pub fn prune_remote_routes_with_prefix(&mut self, prefix: &str) -> bool {
+        // Sub-route keys all start with "<zenoh_id>:" too, so the same prefix
+        // matches them. Use `|` (not `||`) to prune every sub-route, not short-circuit.
+        let pruned = self.route_send_goal.prune_remote_routes_with_prefix(prefix)
+            | self.route_cancel_goal.prune_remote_routes_with_prefix(prefix)
+            | self.route_get_result.prune_remote_routes_with_prefix(prefix)
+            | self.route_feedback.prune_remote_routes_with_prefix(prefix)
+            | self.route_status.prune_remote_routes_with_prefix(prefix);
+        let before = self.remote_routes.len();
+        self.remote_routes.retain(|r| !r.starts_with(prefix));
+        let pruned = pruned || self.remote_routes.len() != before;
+        if pruned {
+            tracing::debug!("{self} now serving remote routes {:?}", self.remote_routes);
+        }
+        pruned
+    }
+
     #[inline]
     pub async fn add_local_node(&mut self, node: String) {
         futures::join!(

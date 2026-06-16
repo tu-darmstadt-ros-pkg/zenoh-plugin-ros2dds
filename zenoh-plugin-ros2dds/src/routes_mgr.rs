@@ -554,6 +554,44 @@ impl RoutesMgr {
         Ok(())
     }
 
+    /// A remote bridge's zenoh transport was lost (its session dropped). On an
+    /// UNGRACEFUL loss (WiFi drop, peer crash/restart) the per-announcement
+    /// Retired* liveliness events are NOT delivered, so each route's
+    /// `remote_routes` would keep its now-dead "<zenoh_id>:..." entries forever:
+    /// the route stays discoverable but its DDS entities are never torn down and
+    /// rebuilt against the reconnecting peer (services/actions go "listed but
+    /// dead"). Prune every route's entries for this `zenoh_id` and drop any route
+    /// left unused, reusing each route's normal deactivate()/is_unused() path.
+    pub fn on_remote_bridge_left(&mut self, zenoh_id: &str) {
+        let prefix = format!("{zenoh_id}:");
+        // For each route map: prune the departed peer's remote_routes entries and,
+        // if that leaves the route unused, remove it from the map + admin_space.
+        macro_rules! prune_map {
+            ($map:expr, $ke_prefix:expr) => {
+                $map.retain(|ros2_name, route| {
+                    if !route.prune_remote_routes_with_prefix(&prefix) {
+                        return true; // route untouched by this peer
+                    }
+                    if route.is_unused() {
+                        let zenoh_key_expr =
+                            ros2_name_to_key_expr(ros2_name, &self.context.config);
+                        self.admin_space.remove(&($ke_prefix / &zenoh_key_expr));
+                        tracing::info!("{route} removed (remote bridge {zenoh_id} left)");
+                        false // drop the route
+                    } else {
+                        true
+                    }
+                });
+            };
+        }
+        prune_map!(self.routes_publishers, *KE_PREFIX_ROUTE_PUBLISHER);
+        prune_map!(self.routes_subscribers, *KE_PREFIX_ROUTE_SUBSCRIBER);
+        prune_map!(self.routes_service_srv, *KE_PREFIX_ROUTE_SERVICE_SRV);
+        prune_map!(self.routes_service_cli, *KE_PREFIX_ROUTE_SERVICE_CLI);
+        prune_map!(self.routes_action_srv, *KE_PREFIX_ROUTE_ACTION_SRV);
+        prune_map!(self.routes_action_cli, *KE_PREFIX_ROUTE_ACTION_CLI);
+    }
+
     async fn get_or_create_route_publisher(
         &mut self,
         ros2_name: String,

@@ -471,6 +471,19 @@ impl ROS2PluginRuntime {
         let mut discovery_mgr = DiscoveryMgr::create(self.participant, ros_discovery_mgr.clone());
         discovery_mgr.run(tx).await;
 
+        // Subscribe to zenoh transport events to detect when a remote bridge's
+        // session is lost. Unlike the liveliness Delete (which is NOT delivered
+        // on an UNGRACEFUL peer loss), a transport Delete fires reliably on every
+        // session drop, carrying the peer's zid — used to prune stale remote
+        // routes (otherwise services/actions go "listed but dead" after a flap).
+        let transport_events_listener = self
+            .zsession
+            .info()
+            .transport_events_listener()
+            .with(flume::unbounded())
+            .await
+            .expect("Failed to create transport events listener");
+
         // Create RoutesManager
         let mut routes_mgr = RoutesMgr::new(
             self.config.clone(),
@@ -541,6 +554,22 @@ impl ROS2PluginRuntime {
                             }
                         },
                         Err(e) => tracing::warn!("Error receiving liveliness event: {e}")
+                    }
+                },
+
+                transport_event = transport_events_listener.recv_async() => {
+                    match transport_event {
+                        Ok(evt) => {
+                            // On a remote bridge's session loss (SampleKind::Delete),
+                            // prune its now-stale remote routes so DDS entities are
+                            // torn down and rebuilt cleanly when it reconnects.
+                            if evt.kind() == SampleKind::Delete {
+                                let zenoh_id = evt.transport().zid().to_string();
+                                tracing::info!("Remote zenoh transport lost: {zenoh_id} - pruning its routes");
+                                routes_mgr.on_remote_bridge_left(&zenoh_id);
+                            }
+                        }
+                        Err(e) => tracing::warn!("Error receiving transport event: {e}")
                     }
                 },
 
