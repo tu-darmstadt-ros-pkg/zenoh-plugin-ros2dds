@@ -33,10 +33,24 @@ FILE(GLOB RUST_SRC_FILES
   ${CMAKE_SOURCE_DIR}/zenoh-plugin-ros2dds/src/*.rs
   ${CMAKE_SOURCE_DIR}/Cargo.lock)
 
+# Locate cargo. Fail early with actionable instructions 
+find_program(CARGO_EXECUTABLE cargo HINTS "$ENV{HOME}/.cargo/bin")
+if(NOT CARGO_EXECUTABLE)
+  message(FATAL_ERROR
+    "cargo not found. This package builds a Rust crate and needs rustup with the "
+    "toolchain pinned in rust-toolchain.toml (currently 1.93.0). Install rustup:\n"
+    "  curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y\n"
+    "  source \"$ENV{HOME}/.cargo/env\"\n"
+    "then ensure ~/.cargo/bin is on PATH for the build.")
+endif()
+
 add_custom_command(
   OUTPUT
   ${RUST_TARGET_DIR}/release/zenoh-bridge-ros2dds
-  COMMAND cargo build --release --manifest-path "${CMAKE_SOURCE_DIR}/zenoh-bridge-ros2dds/Cargo.toml" --target-dir "${RUST_TARGET_DIR}"
+  # Run cargo with the working directory set to the source root so rustup finds
+  # the repo's rust-toolchain.toml
+  COMMAND ${CMAKE_COMMAND} -E chdir "${CMAKE_SOURCE_DIR}"
+          ${CARGO_EXECUTABLE} build --release --manifest-path "${CMAKE_SOURCE_DIR}/zenoh-bridge-ros2dds/Cargo.toml" --target-dir "${RUST_TARGET_DIR}"
   DEPENDS
   ${RUST_SRC_FILES}
 )
