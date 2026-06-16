@@ -275,6 +275,19 @@ impl RouteSubscriber {
         tracing::debug!("{self} now serving remote routes {:?}", self.remote_routes);
     }
 
+    /// Remove all remote_routes entries for a departed bridge (prefix
+    /// "<zenoh_id>:"). Returns whether any entry was removed.
+    #[inline]
+    pub fn prune_remote_routes_with_prefix(&mut self, prefix: &str) -> bool {
+        let before = self.remote_routes.len();
+        self.remote_routes.retain(|r| !r.starts_with(prefix));
+        if self.remote_routes.len() == before {
+            return false;
+        }
+        tracing::debug!("{self} now serving remote routes {:?}", self.remote_routes);
+        true
+    }
+
     #[inline]
     pub fn is_serving_remote_route(&self) -> bool {
         !self.remote_routes.is_empty()
