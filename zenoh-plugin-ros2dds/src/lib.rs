@@ -254,7 +254,13 @@ pub async fn run(runtime: DynamicRuntime, config: Config) {
     // Required in case of dynamic lib, otherwise no logs.
     // But cannot be done twice in case of static link.
     zenoh::try_init_log_from_env();
-    tracing::debug!("ROS2 plugin {}", ROS2Plugin::PLUGIN_VERSION);
+    // Logged at INFO (and with a distinctive prefix) so the running build is
+    // easy to confirm from the logs, in both standalone-bridge and dynamically
+    // loaded-plugin deployments.
+    tracing::info!(
+        "zenoh-plugin-ros2dds version {}",
+        ROS2Plugin::PLUGIN_LONG_VERSION
+    );
     tracing::info!("ROS2 plugin {config:?}");
 
     // Check config validity

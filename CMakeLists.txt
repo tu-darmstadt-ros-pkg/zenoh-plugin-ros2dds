@@ -60,4 +60,12 @@ INSTALL_ZENOH(${RUST_TARGET_DIR}/release/zenoh-bridge-ros2dds lib/${PROJECT_NAME
 
 INSTALL_ZENOH(${RUST_TARGET_DIR}/release/zenoh-bridge-ros2dds bin)
 
+# Also install the executable under its original hyphenated name so launchers
+# that call `zenoh-bridge-ros2dds` resolve it directly,
+# in addition to the ROS-convention `zenoh_bridge_ros2dds` installed above.
+install(PROGRAMS
+  ${RUST_TARGET_DIR}/release/zenoh-bridge-ros2dds
+  DESTINATION bin
+)
+
 ament_package()
