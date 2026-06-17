@@ -33,43 +33,15 @@ FILE(GLOB RUST_SRC_FILES
   ${CMAKE_SOURCE_DIR}/zenoh-plugin-ros2dds/src/*.rs
   ${CMAKE_SOURCE_DIR}/Cargo.lock)
 
-# Locate cargo. PREFER a rustup install (~/.cargo/bin) over a distro /usr/bin/cargo
-find_program(CARGO_EXECUTABLE cargo PATHS "$ENV{HOME}/.cargo/bin" NO_DEFAULT_PATH)
-if(NOT CARGO_EXECUTABLE)
-  find_program(CARGO_EXECUTABLE cargo)  # fall back to PATH (e.g. /usr/bin/cargo)
-endif()
-if(NOT CARGO_EXECUTABLE)
-  message(FATAL_ERROR
-    "cargo not found. This package builds a Rust crate and needs rustup with the "
-    "toolchain pinned in rust-toolchain.toml (currently 1.93.0). Install rustup:\n"
-    "  curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y\n"
-    "  source \"$ENV{HOME}/.cargo/env\"\n"
-    "then ensure ~/.cargo/bin is on PATH for the build.")
-endif()
-
-# Verify the toolchain is new enough for the v4 Cargo.lock (needs cargo >= 1.78),
-execute_process(
-  COMMAND ${CMAKE_COMMAND} -E chdir "${CMAKE_SOURCE_DIR}" ${CARGO_EXECUTABLE} --version
-  OUTPUT_VARIABLE _cargo_version_out
-  ERROR_QUIET OUTPUT_STRIP_TRAILING_WHITESPACE)
-string(REGEX MATCH "[0-9]+\\.[0-9]+\\.[0-9]+" _cargo_version "${_cargo_version_out}")
-if(_cargo_version AND _cargo_version VERSION_LESS "1.78")
-  message(FATAL_ERROR
-    "cargo ${_cargo_version} at '${CARGO_EXECUTABLE}' is too old: this package's "
-    "Cargo.lock is v4, which needs cargo >= 1.78. The distro cargo is likely being "
-    "used instead of rustup. Install rustup and ensure ~/.cargo/bin precedes /usr/bin "
-    "on PATH (or remove the apt 'cargo'/'rustc' packages):\n"
-    "  curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y")
-endif()
-message(STATUS "Using cargo ${_cargo_version} at ${CARGO_EXECUTABLE}")
-
 add_custom_command(
   OUTPUT
   ${RUST_TARGET_DIR}/release/zenoh-bridge-ros2dds
-  # Run cargo with the working directory set to the source root so rustup finds
-  # the repo's rust-toolchain.toml
+  # Run cargo from the source root so rustup picks up the pinned toolchain in
+  # rust-toolchain.toml (rustup searches upward from the working directory, not
+  # from --manifest-path; the CMake build dir is outside the source tree).
+  # The build environment is responsible for providing a suitable cargo on PATH.
   COMMAND ${CMAKE_COMMAND} -E chdir "${CMAKE_SOURCE_DIR}"
-          ${CARGO_EXECUTABLE} build --release --manifest-path "${CMAKE_SOURCE_DIR}/zenoh-bridge-ros2dds/Cargo.toml" --target-dir "${RUST_TARGET_DIR}"
+          cargo build --release --manifest-path "${CMAKE_SOURCE_DIR}/zenoh-bridge-ros2dds/Cargo.toml" --target-dir "${RUST_TARGET_DIR}"
   DEPENDS
   ${RUST_SRC_FILES}
 )

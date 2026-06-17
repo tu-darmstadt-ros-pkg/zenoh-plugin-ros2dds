@@ -416,6 +416,7 @@ pub struct ROS2PluginRuntime {
 enum AdminRef {
     Config,
     Version,
+    Host,
 }
 
 impl ROS2PluginRuntime {
@@ -458,6 +459,10 @@ impl ROS2PluginRuntime {
         self.admin_space.insert(
             &admin_prefix / unsafe { keyexpr::from_str_unchecked("version") },
             AdminRef::Version,
+        );
+        self.admin_space.insert(
+            &admin_prefix / unsafe { keyexpr::from_str_unchecked("host") },
+            AdminRef::Host,
         );
 
         // Create and start the RosDiscoveryInfoMgr (managing ros_discovery_info topic)
@@ -805,6 +810,27 @@ impl ROS2PluginRuntime {
                     return;
                 }
             },
+            AdminRef::Host => {
+                // OS hostname of the machine running this bridge, plus the ROS
+                // nodename/namespace — a stable, authoritative host identity for
+                // monitoring tools (independent of how the nodename was set).
+                let hostname = hostname::get()
+                    .ok()
+                    .and_then(|h| h.into_string().ok())
+                    .unwrap_or_default();
+                let v = serde_json::json!({
+                    "hostname": hostname,
+                    "nodename": self.config.nodename,
+                    "namespace": self.config.namespace,
+                });
+                match serde_json::to_vec(&v) {
+                    Ok(bytes) => ZBytes::from(bytes),
+                    Err(e) => {
+                        tracing::warn!("Error transforming JSON to ZBytes: {}", e);
+                        return;
+                    }
+                }
+            }
         };
         if let Err(e) = query
             .reply(key_expr.to_owned(), z_bytes)
