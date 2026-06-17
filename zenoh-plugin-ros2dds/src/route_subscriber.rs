@@ -12,7 +12,16 @@
 //   ZettaScale Zenoh Team, <zenoh@zettascale.tech>
 //
 
-use std::{collections::HashSet, ffi::CStr, fmt, time::Duration};
+use std::{
+    collections::HashSet,
+    ffi::CStr,
+    fmt,
+    sync::{
+        atomic::{AtomicU64, Ordering},
+        Arc,
+    },
+    time::Duration,
+};
 
 use cyclors::{
     dds_entity_t, dds_get_entity_sertype, dds_strretcode, dds_writecdr, ddsi_serdata_from_ser_iov,
@@ -37,6 +46,7 @@ use crate::{
     qos::{History, Qos},
     qos_helpers::is_transient_local,
     ros2_utils::{is_message_for_action, ros2_message_type_to_dds_type},
+    route_publisher::serialize_arc_atomic_u64,
     routes_mgr::Context,
     serialize_option_as_bool, vec_into_raw_parts, LOG_PAYLOAD,
 };
@@ -80,6 +90,12 @@ pub struct RouteSubscriber {
     remote_routes: HashSet<String>,
     // the list of nodes served by this route
     local_nodes: HashSet<String>,
+    // count of messages successfully forwarded Zenoh->DDS by this route
+    #[serde(serialize_with = "serialize_arc_atomic_u64")]
+    fwd_msg_count: Arc<AtomicU64>,
+    // count of payload bytes successfully forwarded Zenoh->DDS by this route
+    #[serde(serialize_with = "serialize_arc_atomic_u64")]
+    fwd_byte_count: Arc<AtomicU64>,
 }
 
 impl Drop for RouteSubscriber {
@@ -163,6 +179,8 @@ impl RouteSubscriber {
             liveliness_token: None,
             remote_routes: HashSet::new(),
             local_nodes: HashSet::new(),
+            fwd_msg_count: Arc::new(AtomicU64::new(0)),
+            fwd_byte_count: Arc::new(AtomicU64::new(0)),
         })
     }
 
@@ -172,8 +190,16 @@ impl RouteSubscriber {
         // Callback routing message received by Zenoh subscriber to DDS Writer (if set)
         let ros2_name = self.ros2_name.clone();
         let dds_writer = self.dds_writer;
+        let fwd_msg_count = self.fwd_msg_count.clone();
+        let fwd_byte_count = self.fwd_byte_count.clone();
         let subscriber_callback = move |s: Sample| {
-            route_zenoh_message_to_dds(s, &ros2_name, dds_writer);
+            route_zenoh_message_to_dds(
+                s,
+                &ros2_name,
+                dds_writer,
+                &fwd_msg_count,
+                &fwd_byte_count,
+            );
         };
 
         // create zenoh subscriber
@@ -326,7 +352,15 @@ impl RouteSubscriber {
     }
 }
 
-fn route_zenoh_message_to_dds(s: Sample, ros2_name: &str, data_writer: dds_entity_t) {
+fn route_zenoh_message_to_dds(
+    s: Sample,
+    ros2_name: &str,
+    data_writer: dds_entity_t,
+    fwd_msg_count: &Arc<AtomicU64>,
+    fwd_byte_count: &Arc<AtomicU64>,
+) {
+    // payload size for traffic accounting (captured before the buffer is moved)
+    let payload_len = s.payload().len();
     if *LOG_PAYLOAD {
         tracing::debug!(
             "Route Subscriber (Zenoh:{} -> ROS:{}): routing message - payload: {:02x?}",
@@ -407,4 +441,8 @@ fn route_zenoh_message_to_dds(s: Sample, ros2_name: &str, data_writer: dds_entit
 
         drop(Vec::from_raw_parts(ptr, len, capacity));
     }
+
+    // count only successful forwards (all failure paths returned early above)
+    fwd_msg_count.fetch_add(1, Ordering::Relaxed);
+    fwd_byte_count.fetch_add(payload_len as u64, Ordering::Relaxed);
 }

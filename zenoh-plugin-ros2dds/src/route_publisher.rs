@@ -16,7 +16,10 @@ use std::{
     collections::HashSet,
     fmt,
     ops::Deref,
-    sync::{atomic::Ordering, Arc},
+    sync::{
+        atomic::{AtomicU64, Ordering},
+        Arc,
+    },
     time::Duration,
 };
 
@@ -113,6 +116,12 @@ pub struct RoutePublisher {
     remote_routes: HashSet<String>,
     // the list of nodes served by this route
     local_nodes: HashSet<String>,
+    // count of messages successfully forwarded DDS->Zenoh by this route
+    #[serde(serialize_with = "serialize_arc_atomic_u64")]
+    fwd_msg_count: Arc<AtomicU64>,
+    // count of payload bytes successfully forwarded DDS->Zenoh by this route
+    #[serde(serialize_with = "serialize_arc_atomic_u64")]
+    fwd_byte_count: Arc<AtomicU64>,
 }
 
 impl Drop for RoutePublisher {
@@ -238,6 +247,11 @@ impl RoutePublisher {
         // (copy/move all required args for the callback)
         let dds_reader: Arc<AtomicDDSEntity> = Arc::new(DDS_ENTITY_NULL.into());
 
+        // traffic counters (shared with the DDS Reader callback, incremented on
+        // each successful forward; surfaced in the admin space)
+        let fwd_msg_count = Arc::new(AtomicU64::new(0));
+        let fwd_byte_count = Arc::new(AtomicU64::new(0));
+
         // NOT backgrounded: the handle is stored in the RoutePublisher below so
         // it is undeclared on Drop (see field doc).
         let matching_listener = publisher
@@ -253,6 +267,8 @@ impl RoutePublisher {
                 let reader_qos = reader_qos.clone();
                 let type_info = type_info.clone();
                 let publisher = publisher.clone();
+                let fwd_msg_count = fwd_msg_count.clone();
+                let fwd_byte_count = fwd_byte_count.clone();
 
                 move |status| {
                     tracing::debug!("{route_id} MatchingStatus changed: {status:?}");
@@ -267,6 +283,8 @@ impl RoutePublisher {
                             &reader_qos,
                             &type_info,
                             &publisher,
+                            &fwd_msg_count,
+                            &fwd_byte_count,
                         ) {
                             tracing::error!("{route_id}: failed to activate DDS Reader: {e}");
                         }
@@ -296,6 +314,8 @@ impl RoutePublisher {
             liveliness_token: None,
             remote_routes: HashSet::new(),
             local_nodes: HashSet::new(),
+            fwd_msg_count,
+            fwd_byte_count,
         })
     }
 
@@ -450,6 +470,8 @@ fn activate_dds_reader(
     reader_qos: &Qos,
     type_info: &Option<Arc<TypeInfo>>,
     publisher: &Arc<AdvancedPublisher<'static>>,
+    fwd_msg_count: &Arc<AtomicU64>,
+    fwd_byte_count: &Arc<AtomicU64>,
 ) -> Result<(), String> {
     tracing::debug!("{route_id}: create Reader with {reader_qos:?}");
     let topic_name: String = format!("rt{}", ros2_name);
@@ -468,8 +490,16 @@ fn activate_dds_reader(
         {
             let route_id = route_id.to_string();
             let publisher = publisher.clone();
+            let fwd_msg_count = fwd_msg_count.clone();
+            let fwd_byte_count = fwd_byte_count.clone();
             move |sample: &DDSRawSample| {
-                route_dds_message_to_zenoh(sample, &publisher, &route_id);
+                route_dds_message_to_zenoh(
+                    sample,
+                    &publisher,
+                    &route_id,
+                    &fwd_msg_count,
+                    &fwd_byte_count,
+                );
             }
         },
     )?;
@@ -510,13 +540,27 @@ fn route_dds_message_to_zenoh(
     sample: &DDSRawSample,
     publisher: &Arc<AdvancedPublisher>,
     route_id: &str,
+    fwd_msg_count: &Arc<AtomicU64>,
+    fwd_byte_count: &Arc<AtomicU64>,
 ) {
     if *LOG_PAYLOAD {
         tracing::debug!("{route_id}: routing message - payload: {:02x?}", sample);
     } else {
         tracing::trace!("{route_id}: routing message - {} bytes", sample.len());
     }
+    let len = sample.len();
     if let Err(e) = publisher.put(sample).wait() {
         tracing::error!("{route_id}: failed to route message: {e}");
+    } else {
+        // count only successful forwards
+        fwd_msg_count.fetch_add(1, Ordering::Relaxed);
+        fwd_byte_count.fetch_add(len as u64, Ordering::Relaxed);
     }
+}
+
+pub fn serialize_arc_atomic_u64<S>(v: &Arc<AtomicU64>, s: S) -> Result<S::Ok, S::Error>
+where
+    S: Serializer,
+{
+    s.serialize_u64(v.load(Ordering::Relaxed))
 }
