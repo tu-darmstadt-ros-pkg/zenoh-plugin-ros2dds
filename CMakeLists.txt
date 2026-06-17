@@ -41,7 +41,7 @@ add_custom_command(
   # from --manifest-path; the CMake build dir is outside the source tree).
   # The build environment is responsible for providing a suitable cargo on PATH.
   COMMAND ${CMAKE_COMMAND} -E chdir "${CMAKE_SOURCE_DIR}"
-          cargo build --release --manifest-path "${CMAKE_SOURCE_DIR}/zenoh-bridge-ros2dds/Cargo.toml" --target-dir "${RUST_TARGET_DIR}"
+          cargo build --release --features stats --manifest-path "${CMAKE_SOURCE_DIR}/zenoh-bridge-ros2dds/Cargo.toml" --target-dir "${RUST_TARGET_DIR}"
   DEPENDS
   ${RUST_SRC_FILES}
 )
