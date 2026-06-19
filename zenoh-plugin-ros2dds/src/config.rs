@@ -67,6 +67,8 @@ pub struct Config {
     pub queries_timeout: Option<QueriesTimeouts>,
     #[serde(default = "default_reliable_routes_blocking")]
     pub reliable_routes_blocking: bool,
+    #[serde(default = "default_forward_unclaimed_publishers")]
+    pub forward_unclaimed_publishers: bool,
     #[serde(
         default,
         deserialize_with = "deserialize_vec_regex_prio",
@@ -490,6 +492,10 @@ impl<'de> serde::de::Visitor<'de> for PathVisitor {
 
 fn default_reliable_routes_blocking() -> bool {
     DEFAULT_RELIABLE_ROUTES_BLOCKING
+}
+
+fn default_forward_unclaimed_publishers() -> bool {
+    true
 }
 
 #[derive(Deserialize, Debug, Serialize, Eq, PartialEq, Clone, Copy)]

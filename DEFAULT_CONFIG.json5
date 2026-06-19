@@ -124,6 +124,17 @@
       // reliable_routes_blocking: true,
 
       ////
+      //// forward_unclaimed_publishers: When true (default), DDS Writers on ROS topics ("rt/...")
+      ////                               that are NOT declared by any ROS node in "ros_discovery_info"
+      ////                               are still forwarded to zenoh, attached to a synthetic
+      ////                               "_zenoh_orphan_endpoints_" node. This covers publishers that
+      ////                               do not register themselves in ROS discovery (e.g. ros2_control's
+      ////                               controller_manager/activity), which would otherwise never be routed.
+      ////                               Set to false to restore the previous node-driven-only behavior.
+      ////
+      // forward_unclaimed_publishers: true,
+
+      ////
       //// queries_timeout: Timeouts configuration for various Zenoh queries.
       ////                  Each field is optional. If not set, the 'default' timeout (5.0 seconds by default) applies to all queries,
       ////                  except for actions' get_result that is by default configured with a larget timeout (300.0 seconds)
