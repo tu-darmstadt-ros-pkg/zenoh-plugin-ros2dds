@@ -49,7 +49,11 @@ impl DiscoveryMgr {
         }
     }
 
-    pub async fn run(&mut self, evt_sender: Sender<ROS2DiscoveryEvent>) {
+    pub async fn run(
+        &mut self,
+        evt_sender: Sender<ROS2DiscoveryEvent>,
+        forward_unclaimed_publishers: bool,
+    ) {
         // run DDS discovery
         let (dds_disco_snd, dds_disco_rcv): (
             Sender<DDSDiscoveryEvent>,
@@ -125,6 +129,16 @@ impl DiscoveryMgr {
                         for part_info in infos {
                             tracing::debug!("Received ros_discovery_info from {}", part_info);
                             let evts = zwrite!(discovered_entities).update_participant_info(part_info);
+                            for e in evts {
+                                if let Err(err) = evt_sender.try_send(e) {
+                                    tracing::error!("Internal error: failed to send DDSDiscoveryEvent to main loop: {err}");
+                                }
+                            }
+                        }
+                        // Forward DDS Writers that no ROS node claims in ros_discovery_info
+                        // (e.g. ros2_control's controller_manager/activity publisher).
+                        if forward_unclaimed_publishers {
+                            let evts = zwrite!(discovered_entities).forward_orphan_writers();
                             for e in evts {
                                 if let Err(err) = evt_sender.try_send(e) {
                                     tracing::error!("Internal error: failed to send DDSDiscoveryEvent to main loop: {err}");

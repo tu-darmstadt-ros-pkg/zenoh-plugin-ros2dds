@@ -573,8 +573,7 @@ impl RoutesMgr {
                         return true; // route untouched by this peer
                     }
                     if route.is_unused() {
-                        let zenoh_key_expr =
-                            ros2_name_to_key_expr(ros2_name, &self.context.config);
+                        let zenoh_key_expr = ros2_name_to_key_expr(ros2_name, &self.context.config);
                         self.admin_space.remove(&($ke_prefix / &zenoh_key_expr));
                         tracing::info!("{route} removed (remote bridge {zenoh_id} left)");
                         false // drop the route

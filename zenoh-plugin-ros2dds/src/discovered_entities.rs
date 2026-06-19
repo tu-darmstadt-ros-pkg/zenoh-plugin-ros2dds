@@ -34,6 +34,12 @@ use crate::{
     ros_discovery::{NodeEntitiesInfo, ParticipantEntitiesInfo},
 };
 
+/// Name of the synthetic ROS node under which DDS writers that no real ROS node
+/// declares in `ros_discovery_info` are attached, so they still get routed.
+/// (e.g. ros2_control's `controller_manager/activity` publisher, which appears in
+/// DDS discovery as `_NODE_NAME_UNKNOWN_`.)
+pub(crate) const ORPHAN_NODE_NAME: &str = "_zenoh_orphan_endpoints_";
+
 kedefine!(
     pub(crate) ke_admin_participant: "dds/${pgid:*}",
     pub(crate) ke_admin_writer: "dds/${pgid:*}/writer/${wgid:*}/${topic:**}",
@@ -274,6 +280,12 @@ impl DiscoveredEntities {
 
         // Remove nodes that are no longer present in ParticipantEntitiesInfo
         nodes_map.retain(|name, node| {
+            // Never remove the synthetic node holding orphan (unclaimed) endpoints:
+            // it is not advertised in ros_discovery_info, so it would always be retained-out.
+            // Its endpoints are cleaned up individually via remove_writer/remove_reader.
+            if name == ORPHAN_NODE_NAME {
+                return true;
+            }
             if !ros_info.node_entities_info_seq.contains_key(name) {
                 tracing::info!("Undiscovered ROS Node {}", name);
                 admin_space.remove(
@@ -287,6 +299,22 @@ impl DiscoveredEntities {
                 true
             }
         });
+
+        // Writer GIDs already owned by the synthetic orphan node (see
+        // forward_orphan_writers). Once a Writer has been forwarded as an orphan it
+        // stays attached to the orphan node for its lifetime, so we must NOT also
+        // attach it to the real node that later starts declaring it - that would
+        // create a duplicate route and leave stale state on teardown (remove_writer
+        // stops at the first owning node).
+        let orphan_writers: std::collections::HashSet<Gid> = nodes_map
+            .get(ORPHAN_NODE_NAME)
+            .map(|node| {
+                node.msg_pub
+                    .values()
+                    .flat_map(|p| p.writers.iter().copied())
+                    .collect()
+            })
+            .unwrap_or_default();
 
         // For each declared node in this ros_node_info
         for (name, ros_node_info) in &ros_info.node_entities_info_seq {
@@ -320,6 +348,7 @@ impl DiscoveredEntities {
                 ros_node_info,
                 readers,
                 writers,
+                &orphan_writers,
             ));
         }
 
@@ -333,6 +362,7 @@ impl DiscoveredEntities {
         ros_node_info: &NodeEntitiesInfo,
         readers: &mut HashMap<Gid, DdsEntity>,
         writers: &mut HashMap<Gid, DdsEntity>,
+        orphan_writers: &std::collections::HashSet<Gid>,
     ) -> Vec<ROS2DiscoveryEvent> {
         let mut events = Vec::new();
         // For each declared Reader
@@ -358,6 +388,12 @@ impl DiscoveredEntities {
         }
         // For each declared Writer
         for wgid in &ros_node_info.writer_gid_seq {
+            // Skip Writers already owned by the synthetic orphan node: they were
+            // forwarded as unclaimed earlier and stay attached there (sticky), so
+            // they must not be attached to this real node as well.
+            if orphan_writers.contains(wgid) {
+                continue;
+            }
             if let Some(entity) = writers.get(wgid) {
                 tracing::trace!(
                     "ROS Node {ros_node_info} declares Writer on {}",
@@ -375,6 +411,85 @@ impl DiscoveredEntities {
                     "ROS Node {ros_node_info} declares a not yet discovered DDS Writer: {wgid}"
                 );
                 node.undiscovered_writer.push(*wgid);
+            }
+        }
+        events
+    }
+
+    /// Forward DDS message Writers (`rt/...`) that no ROS node declares in
+    /// `ros_discovery_info` (RTI labels them `_NODE_NAME_UNKNOWN_`); otherwise they
+    /// are stored but never routed. Each is attached to a synthetic
+    /// [`ORPHAN_NODE_NAME`] node under its participant, reusing the regular Writer
+    /// routing/QoS/undiscovery machinery, and stays owned by it for life (later
+    /// claims by a real node are ignored). Call after processing `ros_discovery_info`,
+    /// so genuinely-claimed writers are never mistaken for orphans.
+    pub fn forward_orphan_writers(&mut self) -> Vec<ROS2DiscoveryEvent> {
+        let mut events: Vec<ROS2DiscoveryEvent> = Vec::new();
+
+        // Set of already-claimed Writer GIDs, built ONCE per sweep. Re-deriving it
+        // per candidate walked every node's publisher map (+ a linear scan of each
+        // node's `undiscovered_writer` Vec), i.e. O(candidates x nodes), under the
+        // discovered_entities write lock on every ros_discovery_info message. Costly
+        // on a large ROS graph; this makes the per-candidate check O(1).
+        let claimed_writers: std::collections::HashSet<Gid> = self
+            .nodes_info
+            .values()
+            .flat_map(|nodes_map| nodes_map.values())
+            .flat_map(|node| {
+                node.undiscovered_writer.iter().copied().chain(
+                    node.msg_pub
+                        .values()
+                        .flat_map(|p| p.writers.iter().copied()),
+                )
+            })
+            .collect();
+
+        // Candidate orphans: plain message Writers ("rt/<topic>") not yet claimed.
+        // Action sub-topics ("rt/<action>/_action/...") are excluded - tracked
+        // separately, not via msg_pub.
+        let orphan_writers: Vec<DdsEntity> = self
+            .writers
+            .values()
+            .filter(|w| w.topic_name.starts_with("rt/") && !w.topic_name.contains("/_action/"))
+            .filter(|w| !claimed_writers.contains(&w.key))
+            .cloned()
+            .collect();
+
+        for writer in orphan_writers {
+            let participant = writer.participant_key;
+            let nodes_map = self.nodes_info.entry(participant).or_default();
+            // Get-or-create the synthetic orphan node for this participant.
+            if !nodes_map.contains_key(ORPHAN_NODE_NAME) {
+                match NodeInfo::create("/".to_string(), ORPHAN_NODE_NAME.to_string(), participant) {
+                    Ok(node) => {
+                        self.admin_space.insert(
+                            keformat!(ke_admin_node::formatter(), node_id = node.id_as_keyexpr(),)
+                                .unwrap(),
+                            EntityRef::Node(participant, node.fullname().to_string()),
+                        );
+                        self.nodes_info
+                            .get_mut(&participant)
+                            .unwrap()
+                            .insert(ORPHAN_NODE_NAME.to_string(), node);
+                    }
+                    Err(e) => {
+                        tracing::warn!("Cannot create synthetic orphan-endpoints node: {e}");
+                        continue;
+                    }
+                }
+            }
+            let node = self
+                .nodes_info
+                .get_mut(&participant)
+                .unwrap()
+                .get_mut(ORPHAN_NODE_NAME)
+                .unwrap();
+            if let Some(e) = node.update_with_writer(&writer) {
+                tracing::info!(
+                    "Forwarding unclaimed DDS Writer on '{}' (not declared by any ROS node)",
+                    writer.topic_name
+                );
+                events.push(e);
             }
         }
         events
@@ -475,6 +590,108 @@ impl DiscoveredEntities {
                 tracing::error!("INTERNAL ERROR serializing admin value as JSON: {}", e)
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use cyclors::qos::Qos;
+
+    use super::*;
+    use crate::ros_discovery::{NodeEntitiesInfo, ParticipantEntitiesInfo};
+
+    fn participant() -> Gid {
+        Gid::from([1; 16])
+    }
+
+    fn writer(gid: u8, topic: &str) -> DdsEntity {
+        DdsEntity {
+            key: Gid::from([gid; 16]),
+            participant_key: participant(),
+            topic_name: topic.to_string(),
+            type_name: "std_msgs::msg::dds_::String_".to_string(),
+            _type_info: None,
+            keyless: true,
+            qos: Qos::default(),
+        }
+    }
+
+    // Returns the node fullname that owns the publisher in a DiscoveredMsgPub event.
+    fn pub_node(event: &ROS2DiscoveryEvent) -> &str {
+        match event {
+            ROS2DiscoveryEvent::DiscoveredMsgPub(node, _) => node,
+            other => panic!("expected DiscoveredMsgPub, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn orphan_writer_is_forwarded_once() {
+        let mut entities = DiscoveredEntities::default();
+        // A plain rt/ Writer that no node declares.
+        assert!(entities.add_writer(writer(10, "rt/some/topic")).is_none());
+
+        // First sweep forwards it under the synthetic orphan node.
+        let events = entities.forward_orphan_writers();
+        assert_eq!(events.len(), 1);
+        assert_eq!(pub_node(&events[0]), format!("/{ORPHAN_NODE_NAME}"));
+
+        // Second sweep is idempotent: already owned, so no new event.
+        assert!(entities.forward_orphan_writers().is_empty());
+    }
+
+    #[test]
+    fn non_message_writers_are_not_forwarded() {
+        let mut entities = DiscoveredEntities::default();
+        entities.add_writer(writer(20, "rq/some/serviceRequest"));
+        entities.add_writer(writer(21, "rr/some/serviceReply"));
+        entities.add_writer(writer(22, "rt/some/action/_action/status"));
+        entities.add_writer(writer(23, "rt/some/action/_action/feedback"));
+
+        // None of these are plain message publishers: nothing is orphan-forwarded.
+        assert!(entities.forward_orphan_writers().is_empty());
+    }
+
+    #[test]
+    fn orphaned_writer_is_not_reclaimed_by_a_late_node() {
+        let mut entities = DiscoveredEntities::default();
+        let w = writer(30, "rt/some/topic");
+        let wgid = w.key;
+        entities.add_writer(w);
+
+        // Forwarded as orphan first.
+        let events = entities.forward_orphan_writers();
+        assert_eq!(events.len(), 1);
+        assert_eq!(pub_node(&events[0]), format!("/{ORPHAN_NODE_NAME}"));
+
+        // Later, a real node starts declaring the very same Writer GID.
+        let mut node_info = NodeEntitiesInfo::new("/".to_string(), "real_node".to_string());
+        node_info.writer_gid_seq.insert(wgid);
+        let mut part_info = ParticipantEntitiesInfo::new(participant());
+        part_info
+            .node_entities_info_seq
+            .insert(node_info.full_name(), node_info);
+
+        // The sticky-orphan rule must hold: no duplicate DiscoveredMsgPub event...
+        let events = entities.update_participant_info(part_info);
+        assert!(
+            events.is_empty(),
+            "late claim must not re-route an already-orphaned Writer, got {events:?}"
+        );
+
+        // ...and the Writer stays owned by exactly the orphan node, not the real one.
+        let nodes = entities.nodes_info.get(&participant()).unwrap();
+        let orphan_owns = nodes
+            .get(ORPHAN_NODE_NAME)
+            .unwrap()
+            .msg_pub
+            .values()
+            .any(|p| p.writers.contains(&wgid));
+        assert!(orphan_owns, "orphan node should still own the Writer");
+        let real_owns = nodes
+            .get("/real_node")
+            .map(|n| n.msg_pub.values().any(|p| p.writers.contains(&wgid)))
+            .unwrap_or(false);
+        assert!(!real_owns, "real node must not also own the Writer");
     }
 }
 

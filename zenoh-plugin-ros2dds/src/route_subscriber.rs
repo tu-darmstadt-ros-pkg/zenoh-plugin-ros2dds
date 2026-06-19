@@ -193,13 +193,7 @@ impl RouteSubscriber {
         let fwd_msg_count = self.fwd_msg_count.clone();
         let fwd_byte_count = self.fwd_byte_count.clone();
         let subscriber_callback = move |s: Sample| {
-            route_zenoh_message_to_dds(
-                s,
-                &ros2_name,
-                dds_writer,
-                &fwd_msg_count,
-                &fwd_byte_count,
-            );
+            route_zenoh_message_to_dds(s, &ros2_name, dds_writer, &fwd_msg_count, &fwd_byte_count);
         };
 
         // create zenoh subscriber

@@ -480,7 +480,9 @@ impl ROS2PluginRuntime {
         let (tx, discovery_rcv): (Sender<ROS2DiscoveryEvent>, Receiver<ROS2DiscoveryEvent>) =
             unbounded();
         let mut discovery_mgr = DiscoveryMgr::create(self.participant, ros_discovery_mgr.clone());
-        discovery_mgr.run(tx).await;
+        discovery_mgr
+            .run(tx, self.config.forward_unclaimed_publishers)
+            .await;
 
         // Subscribe to zenoh transport events to detect when a remote bridge's
         // session is lost. Unlike the liveliness Delete (which is NOT delivered

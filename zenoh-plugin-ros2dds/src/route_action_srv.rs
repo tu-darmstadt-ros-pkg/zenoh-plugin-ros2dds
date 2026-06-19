@@ -239,8 +239,12 @@ impl RouteActionSrv {
         // Sub-route keys all start with "<zenoh_id>:" too, so the same prefix
         // matches them. Use `|` (not `||`) to prune every sub-route, not short-circuit.
         let pruned = self.route_send_goal.prune_remote_routes_with_prefix(prefix)
-            | self.route_cancel_goal.prune_remote_routes_with_prefix(prefix)
-            | self.route_get_result.prune_remote_routes_with_prefix(prefix)
+            | self
+                .route_cancel_goal
+                .prune_remote_routes_with_prefix(prefix)
+            | self
+                .route_get_result
+                .prune_remote_routes_with_prefix(prefix)
             | self.route_feedback.prune_remote_routes_with_prefix(prefix)
             | self.route_status.prune_remote_routes_with_prefix(prefix);
         let before = self.remote_routes.len();
