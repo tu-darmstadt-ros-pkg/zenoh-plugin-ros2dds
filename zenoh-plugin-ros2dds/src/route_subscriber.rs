@@ -161,10 +161,17 @@ impl RouteSubscriber {
             keyless,
             writer_qos,
         )?;
-        // add writer's GID in ros_discovery_info message
-        context
-            .ros_discovery_mgr
-            .add_dds_writer(get_guid(&dds_writer)?);
+        // Read back the GUID before keeping the writer; on failure (e.g. transient
+        // BAD_PARAMETER under participant churn) delete the writer instead of
+        // leaking it and leaving a half-created route.
+        let writer_gid = match get_guid(&dds_writer) {
+            Ok(gid) => gid,
+            Err(e) => {
+                let _ = delete_dds_entity(dds_writer);
+                return Err(e);
+            }
+        };
+        context.ros_discovery_mgr.add_dds_writer(writer_gid);
 
         Ok(RouteSubscriber {
             ros2_name,

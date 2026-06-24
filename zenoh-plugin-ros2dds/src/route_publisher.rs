@@ -503,9 +503,19 @@ fn activate_dds_reader(
             }
         },
     )?;
+    // Read back the GUID before committing the reader into the atomic; on failure
+    // (e.g. transient BAD_PARAMETER under participant churn) delete the reader and
+    // return Err with the atomic left untouched — avoiding a committed-but-dead
+    // reader that would leak and leave the route "listed but dead".
+    let reader_gid = match get_guid(&reader) {
+        Ok(gid) => gid,
+        Err(e) => {
+            let _ = delete_dds_entity(reader);
+            return Err(e);
+        }
+    };
+    context.ros_discovery_mgr.add_dds_reader(reader_gid);
     let old = dds_reader.deref().swap(reader, Ordering::Relaxed);
-    // add reader's GID in ros_discovery_info message
-    context.ros_discovery_mgr.add_dds_reader(get_guid(&reader)?);
 
     if old != DDS_ENTITY_NULL {
         tracing::warn!("{route_id}: on activation their was already a DDS Reader - overwrite it");
