@@ -19,6 +19,7 @@ use std::{
         atomic::{AtomicU64, Ordering},
         Arc, RwLock,
     },
+    time::{Duration, Instant},
 };
 
 use cyclors::dds_entity_t;
@@ -81,7 +82,7 @@ pub struct RouteServiceSrv {
     sequence_number: Arc<AtomicU64>,
     // queries waiting for a reply
     #[serde(skip)]
-    queries_in_progress: Arc<RwLock<HashMap<CddsRequestHeader, Query>>>,
+    queries_in_progress: Arc<RwLock<HashMap<CddsRequestHeader, (Query, Instant)>>>,
     // a liveliness token associated to this route, for announcement to other plugins
     #[serde(skip)]
     liveliness_token: Option<LivelinessToken>,
@@ -181,7 +182,7 @@ impl RouteServiceSrv {
         );
 
         // map of queries in progress
-        let queries_in_progress: Arc<RwLock<HashMap<CddsRequestHeader, Query>>> =
+        let queries_in_progress: Arc<RwLock<HashMap<CddsRequestHeader, (Query, Instant)>>> =
             Arc::new(RwLock::new(HashMap::new()));
 
         // create DDS Reader to receive replies and route them to Zenoh
@@ -202,7 +203,7 @@ impl RouteServiceSrv {
                     route_dds_reply_to_zenoh(
                         sample,
                         zenoh_key_expr.clone(),
-                        &mut zwrite!(queries_in_progress),
+                        &queries_in_progress,
                         &route_id,
                     );
                 }
@@ -260,7 +261,7 @@ impl RouteServiceSrv {
 
         // create the zenoh Queryable
         // if Reader is TRANSIENT_LOCAL, use a PublicationCache to store historical data
-        let queries_in_progress: Arc<RwLock<HashMap<CddsRequestHeader, Query>>> =
+        let queries_in_progress: Arc<RwLock<HashMap<CddsRequestHeader, (Query, Instant)>>> =
             self.queries_in_progress.clone();
         let sequence_number: Arc<AtomicU64> = self.sequence_number.clone();
         let route_id: String = self.to_string();
@@ -273,7 +274,7 @@ impl RouteServiceSrv {
                 .callback(move |query| {
                     route_zenoh_request_to_dds(
                         query,
-                        &mut zwrite!(queries_in_progress),
+                        &queries_in_progress,
                         &sequence_number,
                         &route_id,
                         client_guid,
@@ -387,9 +388,15 @@ impl RouteServiceSrv {
     }
 }
 
+// Entries older than this are evicted lazily on the next insert: the client-
+// side query is long finalized (its timeout has passed), so keeping the Query
+// object only pins memory. Must exceed the largest configured queries_timeout
+// (actions' get_result defaults to 300s).
+const QUERY_GC_TIMEOUT: Duration = Duration::from_secs(600);
+
 fn route_zenoh_request_to_dds(
     query: Query,
-    queries_in_progress: &mut HashMap<CddsRequestHeader, Query>,
+    queries_in_progress: &Arc<RwLock<HashMap<CddsRequestHeader, (Query, Instant)>>>,
     sequence_number: &AtomicU64,
     route_id: &str,
     client_guid: u64,
@@ -462,17 +469,32 @@ fn route_zenoh_request_to_dds(
         );
     }
 
-    queries_in_progress.insert(request_id, query);
+    // Insert (and lazily GC abandoned entries) under a SHORT lock, then write
+    // to DDS with NO lock held: dds_write can block on a full reliable history,
+    // and the reply-reader callback (on Cyclone's shared delivery thread) takes
+    // this same lock - holding it across the write wedged all DDS delivery.
+    {
+        let mut qip = zwrite!(queries_in_progress);
+        let now = Instant::now();
+        qip.retain(|id, (_, inserted)| {
+            let keep = now.duration_since(*inserted) < QUERY_GC_TIMEOUT;
+            if !keep {
+                tracing::debug!("{route_id}: dropping abandoned query {id} (never answered)");
+            }
+            keep
+        });
+        qip.insert(request_id, (query, now));
+    }
     if let Err(e) = dds_write(req_writer, dds_req_buf) {
         tracing::warn!("{route_id}: routing request from Zenoh to DDS failed: {e}");
-        queries_in_progress.remove(&request_id);
+        zwrite!(queries_in_progress).remove(&request_id);
     }
 }
 
 fn route_dds_reply_to_zenoh(
     sample: &DDSRawSample,
     zenoh_key_expr: OwnedKeyExpr,
-    queries_in_progress: &mut HashMap<CddsRequestHeader, Query>,
+    queries_in_progress: &Arc<RwLock<HashMap<CddsRequestHeader, (Query, Instant)>>>,
     route_id: &str,
 ) {
     // Reply payload is expected to be the Response type encoded as CDR, including a 4 bytes CDR header,
@@ -499,9 +521,11 @@ fn route_dds_reply_to_zenoh(
         }
     };
 
-    // Check if it's one of my queries in progress. Drop otherwise
-    match queries_in_progress.remove(&request_id) {
-        Some(query) => {
+    // Check if it's one of my queries in progress (short lock; the blocking
+    // query.reply() below must NOT hold it). Drop otherwise
+    let in_progress = zwrite!(queries_in_progress).remove(&request_id);
+    match in_progress {
+        Some((query, _inserted)) => {
             // route reply buffer stripped from request_id
             let mut zenoh_rep_buf = ZBuf::empty();
             zenoh_rep_buf.push_zslice(header);
