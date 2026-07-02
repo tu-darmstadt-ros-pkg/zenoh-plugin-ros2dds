@@ -17,7 +17,7 @@ use std::{
     fmt,
     sync::{
         atomic::{AtomicBool, Ordering},
-        Arc,
+        Arc, Mutex,
     },
     time::Duration,
 };
@@ -86,6 +86,14 @@ pub struct RouteServiceCli {
     // re-activate its DDS entities when a remote server reconnects (see add_remote_route)
     #[serde(skip)]
     _type_info: Option<Arc<TypeInfo>>,
+    // Serializes activate()/deactivate() across their three unsynchronized
+    // callers (matching-listener callback on a zenoh thread, add_remote_route
+    // re-activation on the routes-mgr task, deactivate on retire/prune/Drop).
+    // Without it, two concurrent activations can commit a MISMATCHED pair:
+    // a live request reader whose callback captured an already-deleted reply
+    // writer - requests then execute but replies go to a dead entity.
+    #[serde(skip)]
+    activation_lock: Arc<Mutex<()>>,
     // a liveliness token associated to this route, for announcement to other plugins
     #[serde(skip)]
     liveliness_token: Option<LivelinessToken>,
@@ -151,6 +159,7 @@ impl RouteServiceCli {
         // (copy/move all required args for the callback)
         let rep_writer: Arc<AtomicDDSEntity> = Arc::new(DDS_ENTITY_NULL.into());
         let req_reader: Arc<AtomicDDSEntity> = Arc::new(DDS_ENTITY_NULL.into());
+        let activation_lock: Arc<Mutex<()>> = Arc::new(Mutex::new(()));
 
         // NOT backgrounded: the handle is stored in the RouteServiceCli below so
         // it is undeclared on Drop (see field doc).
@@ -164,9 +173,13 @@ impl RouteServiceCli {
                 let context = context.clone();
                 let zquerier = zenoh_querier.clone();
                 let type_info = type_info.clone();
+                let activation_lock = activation_lock.clone();
 
                 move |status| {
                         tracing::debug!("{route_id} MatchingStatus changed: {status:?}");
+                        // Serialize with the other activation/deactivation paths
+                        // (survive poisoning: state is the atomics, not the guard).
+                        let _guard = activation_lock.lock().unwrap_or_else(|p| p.into_inner());
                         if status.matching() {
                             if let Err(e) = activate(
                                 &rep_writer,
@@ -204,6 +217,7 @@ impl RouteServiceCli {
             req_reader,
             _matching_listener: Some(matching_listener),
             _type_info: type_info,
+            activation_lock,
             liveliness_token: None,
             remote_routes: HashSet::new(),
             local_nodes: HashSet::new(),
@@ -246,6 +260,10 @@ impl RouteServiceCli {
 
     fn deactivate(&mut self) {
         let route_id = self.to_string();
+        let _guard = self
+            .activation_lock
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
         deactivate(
             &self.rep_writer,
             &self.req_reader,
@@ -270,6 +288,15 @@ impl RouteServiceCli {
             match self._zenoh_querier.matching_status().wait() {
                 Ok(status) if status.matching() => {
                     let route_id = self.to_string();
+                    // Serialize with the matching-listener callback; re-check
+                    // under the lock (the listener may have activated already).
+                    let _guard = self
+                        .activation_lock
+                        .lock()
+                        .unwrap_or_else(|p| p.into_inner());
+                    if self.req_reader.load(Ordering::Relaxed) != DDS_ENTITY_NULL {
+                        return;
+                    }
                     if let Err(e) = activate(
                         &self.rep_writer,
                         &self.req_reader,
@@ -366,6 +393,14 @@ fn activate(
     type_info: &Option<Arc<TypeInfo>>,
     zenoh_querier: &Arc<Querier<'static>>,
 ) -> Result<(), String> {
+    // Already fully active (both entities committed): nothing to do. Callers
+    // hold the activation lock, so this check cannot race another activation.
+    if rep_writer.load(Ordering::Relaxed) != DDS_ENTITY_NULL
+        && req_reader.load(Ordering::Relaxed) != DDS_ENTITY_NULL
+    {
+        tracing::debug!("{route_id}: already active - skipping re-activation");
+        return Ok(());
+    }
     tracing::debug!("{route_id}: activate");
     // Default Service QoS
     let mut qos = QOS_DEFAULT_SERVICE.clone();
