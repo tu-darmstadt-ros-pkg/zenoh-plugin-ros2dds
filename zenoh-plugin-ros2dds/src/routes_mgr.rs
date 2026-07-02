@@ -82,6 +82,9 @@ pub struct Context {
     pub(crate) discovered_entities: Arc<RwLock<DiscoveredEntities>>,
     // ros_discovery_info read/write manager
     pub(crate) ros_discovery_mgr: Arc<RosDiscoveryInfoMgr>,
+    // channel for RouteSubscriber publication-matched events:
+    // (ros2 topic name, any matched DDS reader?) - see on_matched_reader_event
+    pub(crate) matched_reader_tx: flume::Sender<(String, bool)>,
 }
 
 pub struct RoutesMgr {
@@ -100,6 +103,7 @@ pub struct RoutesMgr {
 }
 
 impl RoutesMgr {
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         config: Arc<Config>,
         zsession: Arc<Session>,
@@ -107,6 +111,7 @@ impl RoutesMgr {
         discovered_entities: Arc<RwLock<DiscoveredEntities>>,
         ros_discovery_mgr: Arc<RosDiscoveryInfoMgr>,
         admin_prefix: OwnedKeyExpr,
+        matched_reader_tx: flume::Sender<(String, bool)>,
     ) -> RoutesMgr {
         let context = Context {
             config,
@@ -114,6 +119,7 @@ impl RoutesMgr {
             participant,
             discovered_entities,
             ros_discovery_mgr,
+            matched_reader_tx,
         };
 
         RoutesMgr {
@@ -568,6 +574,18 @@ impl RoutesMgr {
             }
         }
         Ok(())
+    }
+
+    /// A RouteSubscriber's DDS Writer publication-matched status changed:
+    /// DDS-level matching is authoritative local interest, independent of the
+    /// (best-effort) ROS graph. Serves readers that their node never declares
+    /// in ros_discovery_info (`_NODE_NAME_UNKNOWN_` endpoints).
+    pub async fn on_matched_reader_event(&mut self, ros2_name: String, matched: bool) {
+        if let Some(route) = self.routes_subscribers.get_mut(&ros2_name) {
+            route.update_matched_readers(matched).await;
+        }
+        // No route yet: nothing to do - the initial-state callback fires at
+        // route creation, and later matches re-fire the listener.
     }
 
     /// A remote bridge's zenoh transport was lost (its session dropped). On an
