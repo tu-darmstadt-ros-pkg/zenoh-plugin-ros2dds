@@ -138,7 +138,7 @@ impl DiscoveryMgr {
                         // Forward DDS Writers that no ROS node claims in ros_discovery_info
                         // (e.g. ros2_control's controller_manager/activity publisher).
                         if forward_unclaimed_publishers {
-                            let evts = zwrite!(discovered_entities).forward_orphan_writers();
+                            let evts = zwrite!(discovered_entities).forward_orphan_writers(crate::discovered_entities::ORPHAN_GRACE_PERIOD);
                             for e in evts {
                                 if let Err(err) = evt_sender.try_send(e) {
                                     tracing::error!("Internal error: failed to send DDSDiscoveryEvent to main loop: {err}");
