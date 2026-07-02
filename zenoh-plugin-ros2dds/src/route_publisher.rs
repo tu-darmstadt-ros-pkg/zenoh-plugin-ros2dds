@@ -143,6 +143,10 @@ pub struct RoutePublisher {
     // blocking) zenoh put. See create() for the rationale.
     #[serde(skip)]
     fwd_tx: flume::Sender<FwdCmd>,
+    // Set on Drop; the forwarder task checks it on its periodic wakeup, so
+    // termination is guaranteed even when FwdCmd::Stop cannot be enqueued.
+    #[serde(skip)]
+    fwd_stop: Arc<AtomicBool>,
     // Serializes DDS Reader activation/deactivation between the matching-
     // listener callback (zenoh thread) and the routes-mgr paths
     // (add_remote_route reactivation, remove/prune deactivation).
@@ -167,13 +171,12 @@ impl Drop for RoutePublisher {
             }
         }
         self.deactivate_dds_reader();
-        // Stop the forwarder task. A sentinel is needed (not just dropping our
-        // sender) because cyclors leaks the reader-callback closure, which owns
-        // another sender clone. Bounded wait: if the queue is full the task is
-        // wedged in a blocking put anyway and will be reaped with the runtime.
-        let _ = self
-            .fwd_tx
-            .send_timeout(FwdCmd::Stop, Duration::from_millis(100));
+        // Stop the forwarder task: flag first (checked on its periodic wakeup,
+        // guaranteed path), then a best-effort sentinel for prompt shutdown.
+        // Both are needed because cyclors leaks the reader-callback closure,
+        // which owns a Sender clone - the channel never disconnects.
+        self.fwd_stop.store(true, Ordering::Relaxed);
+        let _ = self.fwd_tx.try_send(FwdCmd::Stop);
     }
 }
 
@@ -302,16 +305,28 @@ impl RoutePublisher {
         // queue; the forwarder task below performs the (possibly blocking) put.
         // When the queue is full the sample is DROPPED and counted - a bounded,
         // observable degradation instead of a bridge-wide wedge.
-        let (fwd_tx, fwd_rx) = flume::bounded::<FwdCmd>(FWD_QUEUE_SIZE);
+        //
+        // TRANSIENT_LOCAL routes get a queue at least as deep as their
+        // publication cache so the historical burst delivered at reader
+        // activation is not truncated at FWD_QUEUE_SIZE (capped at 4096).
+        let queue_size = FWD_QUEUE_SIZE.max(cache_size.min(4096));
+        let (fwd_tx, fwd_rx) = flume::bounded::<FwdCmd>(queue_size);
+        let fwd_stop = Arc::new(AtomicBool::new(false));
         {
             let publisher = publisher.clone();
             let fwd_msg_count = fwd_msg_count.clone();
             let fwd_byte_count = fwd_byte_count.clone();
             let route_id = format!("Route Publisher (ROS:{ros2_name} -> Zenoh:{zenoh_key_expr})");
+            let fwd_stop = fwd_stop.clone();
             tokio::task::spawn(async move {
-                while let Ok(cmd) = fwd_rx.recv_async().await {
-                    match cmd {
-                        FwdCmd::Msg(payload) => {
+                loop {
+                    // Bounded wait + stop flag: the FwdCmd::Stop sentinel alone
+                    // is not guaranteed to be deliverable (the queue may be full
+                    // at Drop, and the leaked cyclors callback closure keeps a
+                    // Sender alive so the channel never disconnects). Without
+                    // this, a torn-down route leaked its task + zenoh publisher.
+                    match tokio::time::timeout(Duration::from_secs(10), fwd_rx.recv_async()).await {
+                        Ok(Ok(FwdCmd::Msg(payload))) => {
                             let len = payload.len();
                             if let Err(e) = publisher.put(payload).await {
                                 tracing::error!("{route_id}: failed to route message: {e}");
@@ -320,7 +335,12 @@ impl RoutePublisher {
                                 fwd_byte_count.fetch_add(len as u64, Ordering::Relaxed);
                             }
                         }
-                        FwdCmd::Stop => break,
+                        Ok(Ok(FwdCmd::Stop)) | Ok(Err(_)) => break,
+                        Err(_timeout) => {
+                            if fwd_stop.load(Ordering::Relaxed) {
+                                break;
+                            }
+                        }
                     }
                 }
                 tracing::debug!("{route_id}: forwarder task terminated");
@@ -348,8 +368,10 @@ impl RoutePublisher {
 
                 move |status| {
                     tracing::debug!("{route_id} MatchingStatus changed: {status:?}");
-                    is_matching.store(status.matching(), Ordering::Relaxed);
                     let _guard = activation_lock.lock().unwrap_or_else(|p| p.into_inner());
+                    // under the lock: keeps the flag consistent with the
+                    // activation state committed by this callback
+                    is_matching.store(status.matching(), Ordering::Relaxed);
                     if status.matching() {
                         if let Err(e) = activate_dds_reader(
                             &dds_reader,
@@ -395,6 +417,7 @@ impl RoutePublisher {
             fwd_byte_count,
             dropped_msg_count,
             fwd_tx,
+            fwd_stop,
             activation_lock,
             is_matching,
         })

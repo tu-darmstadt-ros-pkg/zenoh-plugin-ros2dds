@@ -390,9 +390,11 @@ impl RouteServiceSrv {
 
 // Entries older than this are evicted lazily on the next insert: the client-
 // side query is long finalized (its timeout has passed), so keeping the Query
-// object only pins memory. Must exceed the largest configured queries_timeout
-// (actions' get_result defaults to 300s).
-const QUERY_GC_TIMEOUT: Duration = Duration::from_secs(600);
+// object only pins memory. Deliberately much larger than any sane
+// queries_timeout configuration (default 120s, actions' get_result 300s,
+// arbitrary per-service overrides): evicting a still-live query would drop its
+// reply, so err far on the side of holding memory.
+const QUERY_GC_TIMEOUT: Duration = Duration::from_secs(3600);
 
 fn route_zenoh_request_to_dds(
     query: Query,
@@ -473,21 +475,30 @@ fn route_zenoh_request_to_dds(
     // to DDS with NO lock held: dds_write can block on a full reliable history,
     // and the reply-reader callback (on Cyclone's shared delivery thread) takes
     // this same lock - holding it across the write wedged all DDS delivery.
+    let inserted_at = Instant::now();
     {
         let mut qip = zwrite!(queries_in_progress);
-        let now = Instant::now();
         qip.retain(|id, (_, inserted)| {
-            let keep = now.duration_since(*inserted) < QUERY_GC_TIMEOUT;
+            let keep = inserted_at.duration_since(*inserted) < QUERY_GC_TIMEOUT;
             if !keep {
                 tracing::debug!("{route_id}: dropping abandoned query {id} (never answered)");
             }
             keep
         });
-        qip.insert(request_id, (query, now));
+        qip.insert(request_id, (query, inserted_at));
     }
     if let Err(e) = dds_write(req_writer, dds_req_buf) {
         tracing::warn!("{route_id}: routing request from Zenoh to DDS failed: {e}");
-        zwrite!(queries_in_progress).remove(&request_id);
+        // Remove only OUR entry: a concurrent retry with the same request_id
+        // (attachment-provided ids are not unique across retries) may have
+        // replaced it after a SUCCESSFUL write - its reply must still resolve.
+        let mut qip = zwrite!(queries_in_progress);
+        if qip
+            .get(&request_id)
+            .is_some_and(|(_, inserted)| *inserted == inserted_at)
+        {
+            qip.remove(&request_id);
+        }
     }
 }
 
