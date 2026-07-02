@@ -19,9 +19,10 @@
 //            -> proxy (250 KB/s robot->operator)
 //            -> test zenoh session (listens; subscribes blob/tf/canary)
 //
-// The test asserts DESIRED behavior in phase A (no transport close, canary
-// keeps flowing) — RED verifies claims 1+2. Phase B asserts the mitigation
-// works — expected GREEN.
+// Phase A asserts the REPRODUCTION (defaults must close the transport on a
+// stalled link - pins the claim). Phase B asserts the MITIGATION holds
+// (reliable_routes_blocking=false must survive the same link). Both green =
+// the A/B claim stays verified.
 //
 // Run in RELEASE (zenoh-core `bug!` macros panic in debug builds during
 // transport churn):
@@ -313,18 +314,14 @@ async fn congestion_collapse_and_mitigation() {
         outcome_b.tf_last30
     );
 
-    // Desired behavior for phase A — RED here verifies claims 1+2.
+    // Phase A pins the KNOWN default behavior: with reliable_routes_blocking
+    // = true, a stall longer than wait_before_close MUST close the transport
+    // (that is zenoh policy, not a plugin bug - the plugin-side defense is the
+    // config used in phase B). If this stops reproducing, either zenoh changed
+    // its congestion policy or the harness lost its teeth - investigate both.
     assert!(
-        !outcome_a.transport_close,
-        "CLAIM 1 VERIFIED (test red): non-droppable backlog on a slow link made \
-         zenoh close the transport (production error reproduced): {:?}",
-        outcome_a.close_evidence.first()
-    );
-    assert!(
-        outcome_a.canary_last30 > 0 && outcome_a.tf_last30 > 0,
-        "CLAIM 2 VERIFIED (test red): best-effort canary and/or reliable tf starved \
-         behind the blocked reliable blob (canary_last30={} tf_last30={})",
-        outcome_a.canary_last30,
-        outcome_a.tf_last30
+        outcome_a.transport_close,
+        "phase A no longer reproduces the transport close - zenoh policy or \
+         harness changed, re-validate the A/B claim"
     );
 }

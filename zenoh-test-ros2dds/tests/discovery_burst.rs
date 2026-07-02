@@ -31,7 +31,12 @@ use futures::StreamExt;
 use r2r::QosProfile;
 
 const BRIDGE_EP: &str = "tcp/127.0.0.1:7471";
-const NUM_TOPICS: usize = 120; // well above the 32-sample take batch
+fn num_topics() -> usize {
+    std::env::var("BURST_TOPICS")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(300) // ~10x the 32-sample take batch
+}
 const NODE_FULLNAME: &str = "/burst_sub";
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -42,7 +47,7 @@ async fn burst_of_subscriptions_all_get_active_routes() {
     let _bridge = common::create_bridge_with(&BridgeConfig::new(0).listen(BRIDGE_EP)).await;
     tokio::time::sleep(Duration::from_secs(2)).await;
 
-    // ROS node creating NUM_TOPICS subscriptions as fast as possible (the
+    // ROS node creating num_topics() subscriptions as fast as possible (the
     // burst). Each received message is forwarded with its topic index so we
     // can verify end-to-end delivery per topic.
     let (msg_tx, msg_rx) = mpsc::channel::<usize>();
@@ -61,7 +66,7 @@ async fn burst_of_subscriptions_all_get_active_routes() {
             .unwrap();
         rt.block_on(async move {
             // THE BURST: no sleeps between creations.
-            for i in 0..NUM_TOPICS {
+            for i in 0..num_topics() {
                 let sub = node
                     .subscribe::<r2r::std_msgs::msg::String>(
                         &format!("/burst_topic_{i}"),
@@ -103,7 +108,7 @@ async fn burst_of_subscriptions_all_get_active_routes() {
     // 1) Bookkeeping check: every topic has a subscriber route listing the node.
     let routes = common::fetch_routes(&session, "topic/sub").await;
     let mut missing_route = Vec::new();
-    for i in 0..NUM_TOPICS {
+    for i in 0..num_topics() {
         let key = format!("burst_topic_{i}");
         match routes.get(&key) {
             Some(r) if common::route_serves_node(r, NODE_FULLNAME) => {}
@@ -117,7 +122,7 @@ async fn burst_of_subscriptions_all_get_active_routes() {
 
     // 2) Functional check: publish on every topic via zenoh, verify delivery.
     let mut publishers = Vec::new();
-    for i in 0..NUM_TOPICS {
+    for i in 0..num_topics() {
         publishers.push(
             session
                 .declare_publisher(format!("burst_topic_{i}"))
@@ -140,7 +145,7 @@ async fn burst_of_subscriptions_all_get_active_routes() {
     while let Ok(i) = msg_rx.try_recv() {
         *received.entry(i).or_default() += 1;
     }
-    let dead: Vec<String> = (0..NUM_TOPICS)
+    let dead: Vec<String> = (0..num_topics())
         .filter(|i| !received.contains_key(i))
         .map(|i| format!("burst_topic_{i}"))
         .collect();
@@ -148,8 +153,9 @@ async fn burst_of_subscriptions_all_get_active_routes() {
     stop.store(true, Ordering::Relaxed);
 
     println!(
-        "=== burst result: {}/{NUM_TOPICS} topics delivered data; {} route-bookkeeping problems ===",
-        NUM_TOPICS - dead.len(),
+        "=== burst result: {}/{} topics delivered data; {} route-bookkeeping problems ===",
+        num_topics() - dead.len(),
+        num_topics(),
         missing_route.len()
     );
     for m in &missing_route {
@@ -162,8 +168,9 @@ async fn burst_of_subscriptions_all_get_active_routes() {
     assert!(
         missing_route.is_empty() && dead.is_empty(),
         "CLAIM VERIFIED (test red): {} subscriptions have no/incomplete route, \
-         {} topics deliver no data after a {NUM_TOPICS}-endpoint discovery burst",
+         {} topics deliver no data after a {}-endpoint discovery burst",
         missing_route.len(),
-        dead.len()
+        dead.len(),
+        num_topics()
     );
 }
