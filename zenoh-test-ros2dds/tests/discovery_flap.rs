@@ -33,8 +33,18 @@ use futures::StreamExt;
 use r2r::QosProfile;
 
 const BRIDGE_EP: &str = "tcp/127.0.0.1:7472";
-const NUM_TOPICS: usize = 40;
-const FLAP_CYCLES: usize = 6; // create/destroy cycles before the final keeper
+fn env_usize(key: &str, default: usize) -> usize {
+    std::env::var(key)
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(default)
+}
+fn num_topics() -> usize {
+    env_usize("FLAP_TOPICS", 60)
+}
+fn flap_cycles() -> usize {
+    env_usize("FLAP_CYCLES", 8)
+}
 const NODE_FULLNAME: &str = "/flap_sub";
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -70,9 +80,9 @@ async fn flapped_subscriptions_all_get_active_routes() {
             // r2r finalizes dropped subscriptions during spin_once: the flap
             // needs spins BETWEEN drop and re-create to actually destroy the
             // DDS reader (mirrors RViz destroy@.778 / recreate@.870).
-            for i in 0..NUM_TOPICS {
+            for i in 0..num_topics() {
                 let topic = format!("/flap_topic_{i}");
-                for _cycle in 0..FLAP_CYCLES {
+                for _cycle in 0..flap_cycles() {
                     let s = node
                         .subscribe::<r2r::std_msgs::msg::String>(&topic, QosProfile::default())
                         .unwrap();
@@ -123,7 +133,7 @@ async fn flapped_subscriptions_all_get_active_routes() {
     // 1) Bookkeeping: every topic's route lists the node.
     let routes = common::fetch_routes(&session, "topic/sub").await;
     let mut missing_route = Vec::new();
-    for i in 0..NUM_TOPICS {
+    for i in 0..num_topics() {
         let key = format!("flap_topic_{i}");
         match routes.get(&key) {
             Some(r) if common::route_serves_node(r, NODE_FULLNAME) => {}
@@ -137,7 +147,7 @@ async fn flapped_subscriptions_all_get_active_routes() {
 
     // 2) Functional: publish on every topic, verify the keeper receives.
     let mut publishers = Vec::new();
-    for i in 0..NUM_TOPICS {
+    for i in 0..num_topics() {
         publishers.push(
             session
                 .declare_publisher(format!("flap_topic_{i}"))
@@ -160,7 +170,7 @@ async fn flapped_subscriptions_all_get_active_routes() {
     while let Ok(i) = msg_rx.try_recv() {
         *received.entry(i).or_default() += 1;
     }
-    let dead: Vec<String> = (0..NUM_TOPICS)
+    let dead: Vec<String> = (0..num_topics())
         .filter(|i| !received.contains_key(i))
         .map(|i| format!("flap_topic_{i}"))
         .collect();
@@ -185,8 +195,9 @@ async fn flapped_subscriptions_all_get_active_routes() {
     }
 
     println!(
-        "=== flap result: {}/{NUM_TOPICS} topics delivered data; {} route-bookkeeping problems ===",
-        NUM_TOPICS - dead.len(),
+        "=== flap result: {}/{} topics delivered data; {} route-bookkeeping problems ===",
+        num_topics() - dead.len(),
+        num_topics(),
         missing_route.len()
     );
     for m in &missing_route {
