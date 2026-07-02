@@ -174,8 +174,10 @@ impl RoutesMgr {
                     let route = entry.get_mut();
                     route.remove_local_node(&node);
                     if route.is_unused() {
-                        self.admin_space
-                            .remove(&(*KE_PREFIX_ROUTE_PUBLISHER / iface.name_as_keyexpr()));
+                        self.admin_space.remove(
+                            &(*KE_PREFIX_ROUTE_PUBLISHER
+                                / &ros2_name_to_key_expr(&iface.name, &self.context.config)),
+                        );
                         let route = entry.remove();
                         tracing::info!("{route} removed");
                     }
@@ -222,8 +224,10 @@ impl RoutesMgr {
                     let route = entry.get_mut();
                     route.remove_local_node(&node);
                     if route.is_unused() {
-                        self.admin_space
-                            .remove(&(*KE_PREFIX_ROUTE_SUBSCRIBER / iface.name_as_keyexpr()));
+                        self.admin_space.remove(
+                            &(*KE_PREFIX_ROUTE_SUBSCRIBER
+                                / &ros2_name_to_key_expr(&iface.name, &self.context.config)),
+                        );
                         let route = entry.remove();
                         tracing::info!("{route} removed");
                     }
@@ -243,8 +247,10 @@ impl RoutesMgr {
                     let route = entry.get_mut();
                     route.remove_local_node(&node);
                     if route.is_unused() {
-                        self.admin_space
-                            .remove(&(*KE_PREFIX_ROUTE_SERVICE_SRV / iface.name_as_keyexpr()));
+                        self.admin_space.remove(
+                            &(*KE_PREFIX_ROUTE_SERVICE_SRV
+                                / &ros2_name_to_key_expr(&iface.name, &self.context.config)),
+                        );
                         let route = entry.remove();
                         tracing::info!("{route} removed");
                     }
@@ -264,8 +270,10 @@ impl RoutesMgr {
                     let route = entry.get_mut();
                     route.remove_local_node(&node);
                     if route.is_unused() {
-                        self.admin_space
-                            .remove(&(*KE_PREFIX_ROUTE_SERVICE_CLI / iface.name_as_keyexpr()));
+                        self.admin_space.remove(
+                            &(*KE_PREFIX_ROUTE_SERVICE_CLI
+                                / &ros2_name_to_key_expr(&iface.name, &self.context.config)),
+                        );
                         let route = entry.remove();
                         tracing::info!("{route} removed");
                     }
@@ -284,8 +292,10 @@ impl RoutesMgr {
                     let route = entry.get_mut();
                     route.remove_local_node(&node);
                     if route.is_unused() {
-                        self.admin_space
-                            .remove(&(*KE_PREFIX_ROUTE_ACTION_SRV / iface.name_as_keyexpr()));
+                        self.admin_space.remove(
+                            &(*KE_PREFIX_ROUTE_ACTION_SRV
+                                / &ros2_name_to_key_expr(&iface.name, &self.context.config)),
+                        );
                         let route = entry.remove();
                         tracing::info!("{route} removed");
                     }
@@ -304,8 +314,10 @@ impl RoutesMgr {
                     let route = entry.get_mut();
                     route.remove_local_node(&node);
                     if route.is_unused() {
-                        self.admin_space
-                            .remove(&(*KE_PREFIX_ROUTE_ACTION_CLI / iface.name_as_keyexpr()));
+                        self.admin_space.remove(
+                            &(*KE_PREFIX_ROUTE_ACTION_CLI
+                                / &ros2_name_to_key_expr(&iface.name, &self.context.config)),
+                        );
                         let route = entry.remove();
                         tracing::info!("{route} removed");
                     }
@@ -508,8 +520,10 @@ impl RoutesMgr {
                     let route = entry.get_mut();
                     route.remove_remote_route(&zenoh_id, &zenoh_key_expr);
                     if route.is_unused() {
+                        // was KE_PREFIX_ROUTE_SERVICE_CLI: never matched the
+                        // ACTION_CLI insertion key -> dangling admin entries
                         self.admin_space
-                            .remove(&(*KE_PREFIX_ROUTE_SERVICE_CLI / &zenoh_key_expr));
+                            .remove(&(*KE_PREFIX_ROUTE_ACTION_CLI / &zenoh_key_expr));
                         let route = entry.remove();
                         tracing::info!("{route} removed");
                     }
@@ -543,8 +557,10 @@ impl RoutesMgr {
                     let route = entry.get_mut();
                     route.remove_remote_route(&zenoh_id, &zenoh_key_expr);
                     if route.is_unused() {
+                        // was KE_PREFIX_ROUTE_SERVICE_SRV: never matched the
+                        // ACTION_SRV insertion key -> dangling admin entries
                         self.admin_space
-                            .remove(&(*KE_PREFIX_ROUTE_SERVICE_SRV / &zenoh_key_expr));
+                            .remove(&(*KE_PREFIX_ROUTE_ACTION_SRV / &zenoh_key_expr));
                         let route = entry.remove();
                         tracing::info!("{route} removed");
                     }

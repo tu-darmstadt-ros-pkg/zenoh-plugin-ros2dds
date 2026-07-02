@@ -578,7 +578,14 @@ impl ROS2PluginRuntime {
                                     // the liveliness token corresponds to a ROS2 announcement
                                     (Some(remaining), _) => {
                                         // parse it and pass ROS2AnnouncementEvent to RoutesMgr
-                                        match self.parse_announcement_event(ke, &remaining.as_str()[..3], evt.kind()) {
+                                        // A malformed/foreign token with a <3 byte
+                                        // suffix must not panic the plugin task.
+                                        let remaining_str = remaining.as_str();
+                                        if remaining_str.len() < 3 {
+                                            tracing::warn!("Ignoring liveliness token with unexpected short suffix: {ke}");
+                                            continue;
+                                        }
+                                        match self.parse_announcement_event(ke, &remaining_str[..3], evt.kind()) {
                                             Ok(evt) => {
                                                 if self.is_announcement_allowed(&evt) {
                                                     tracing::info!("Remote bridge {zenoh_id} {evt} - Allowed");
@@ -608,9 +615,21 @@ impl ROS2PluginRuntime {
                             // prune its now-stale remote routes so DDS entities are
                             // torn down and rebuilt cleanly when it reconnects.
                             if evt.kind() == SampleKind::Delete {
-                                let zenoh_id = evt.transport().zid().to_string();
-                                tracing::info!("Remote zenoh transport lost: {zenoh_id} - pruning its routes");
-                                routes_mgr.on_remote_bridge_left(&zenoh_id);
+                                let zid = *evt.transport().zid();
+                                let zenoh_id = zid.to_string();
+                                // Stale-event guard: transport events and the
+                                // peer's (re-)announcements arrive on separate
+                                // channels. If the peer already reconnected,
+                                // pruning now would tear down freshly rebuilt
+                                // routes with nothing left to rebuild them.
+                                let reconnected = self.zsession.info().peers_zid().await.any(|z| z == zid)
+                                    || self.zsession.info().routers_zid().await.any(|z| z == zid);
+                                if reconnected {
+                                    tracing::info!("Remote zenoh transport lost: {zenoh_id} - already re-established, NOT pruning");
+                                } else {
+                                    tracing::info!("Remote zenoh transport lost: {zenoh_id} - pruning its routes");
+                                    routes_mgr.on_remote_bridge_left(&zenoh_id);
+                                }
                             }
                         }
                         Err(e) => tracing::warn!("Error receiving transport event: {e}")

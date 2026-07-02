@@ -287,7 +287,17 @@ impl RosDiscoveryInfoMgr {
                     let raw_sample = DDSRawSample::create(zp);
 
                     // No need to deserialize the full payload. Just read the Participant gid (first 16 bytes of the payload)
-                    let gid = hex::encode(&raw_sample.payload_as_slice()[0..16]);
+                    let payload = raw_sample.payload_as_slice();
+                    if payload.len() < 16 {
+                        // malformed sample: must not panic the discovery task
+                        tracing::warn!(
+                            "Ignoring invalid ros_discovery_info sample ({} bytes)",
+                            payload.len()
+                        );
+                        ddsi_serdata_unref(zp);
+                        continue;
+                    }
+                    let gid = hex::encode(&payload[0..16]);
 
                     map.insert(gid, raw_sample);
                 }
