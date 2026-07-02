@@ -142,10 +142,14 @@ impl DDSRawSample {
                     return iox_chunk.as_slice();
                 }
             }
-            &slice::from_raw_parts(
+            let data = slice::from_raw_parts(
                 self.data.iov_base as *const u8,
                 ddsrt_iov_len_to_usize(self.data.iov_len).unwrap(),
-            )[4..]
+            );
+            // A sample shorter than the 4-byte CDR header is malformed; return
+            // an empty payload instead of panicking (a buggy/malicious peer
+            // must not be able to kill the discovery task).
+            data.get(4..).unwrap_or(&[])
         }
     }
 

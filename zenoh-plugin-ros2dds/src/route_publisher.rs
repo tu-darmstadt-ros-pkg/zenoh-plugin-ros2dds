@@ -17,8 +17,8 @@ use std::{
     fmt,
     ops::Deref,
     sync::{
-        atomic::{AtomicU64, Ordering},
-        Arc,
+        atomic::{AtomicBool, AtomicU64, Ordering},
+        Arc, Mutex,
     },
     time::Duration,
 };
@@ -143,6 +143,16 @@ pub struct RoutePublisher {
     // blocking) zenoh put. See create() for the rationale.
     #[serde(skip)]
     fwd_tx: flume::Sender<FwdCmd>,
+    // Serializes DDS Reader activation/deactivation between the matching-
+    // listener callback (zenoh thread) and the routes-mgr paths
+    // (add_remote_route reactivation, remove/prune deactivation).
+    #[serde(skip)]
+    activation_lock: Arc<Mutex<()>>,
+    // Last matching status seen by the listener. add_remote_route uses it to
+    // re-activate a reader deactivated by a late-processed retire/prune when
+    // no further matching transition will ever fire ("listed but dead").
+    #[serde(skip)]
+    is_matching: Arc<AtomicBool>,
 }
 
 impl Drop for RoutePublisher {
@@ -274,6 +284,8 @@ impl RoutePublisher {
         // activate/deactivate DDS Reader on detection/undetection of matching Subscribers
         // (copy/move all required args for the callback)
         let dds_reader: Arc<AtomicDDSEntity> = Arc::new(DDS_ENTITY_NULL.into());
+        let activation_lock: Arc<Mutex<()>> = Arc::new(Mutex::new(()));
+        let is_matching: Arc<AtomicBool> = Arc::new(AtomicBool::new(false));
 
         // traffic counters (incremented by the forwarder task on each
         // successful forward; surfaced in the admin space)
@@ -331,9 +343,13 @@ impl RoutePublisher {
                 let type_info = type_info.clone();
                 let fwd_tx = fwd_tx.clone();
                 let dropped_msg_count = dropped_msg_count.clone();
+                let activation_lock = activation_lock.clone();
+                let is_matching = is_matching.clone();
 
                 move |status| {
                     tracing::debug!("{route_id} MatchingStatus changed: {status:?}");
+                    is_matching.store(status.matching(), Ordering::Relaxed);
+                    let _guard = activation_lock.lock().unwrap_or_else(|p| p.into_inner());
                     if status.matching() {
                         if let Err(e) = activate_dds_reader(
                             &dds_reader,
@@ -379,10 +395,16 @@ impl RoutePublisher {
             fwd_byte_count,
             dropped_msg_count,
             fwd_tx,
+            activation_lock,
+            is_matching,
         })
     }
 
     fn deactivate_dds_reader(&mut self) {
+        let _guard = self
+            .activation_lock
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
         let dds_reader = self.dds_reader.swap(DDS_ENTITY_NULL, Ordering::Relaxed);
         if dds_reader != DDS_ENTITY_NULL {
             // remove reader's GID from ros_discovery_info message
@@ -431,6 +453,37 @@ impl RoutePublisher {
         self.remote_routes
             .insert(format!("{zenoh_id}:{zenoh_key_expr}"));
         tracing::debug!("{self} now serving remote routes {:?}", self.remote_routes);
+
+        // Reconnect fallback (same pattern as RouteServiceCli): if a late-
+        // processed retire/prune deactivated the DDS Reader AFTER the matching
+        // listener already fired true, no further transition will ever fire
+        // and the route stayed "listed but dead". Re-activate here.
+        if self.is_matching.load(Ordering::Relaxed)
+            && self.dds_reader.load(Ordering::Relaxed) == DDS_ENTITY_NULL
+        {
+            let route_id = self.to_string();
+            let _guard = self
+                .activation_lock
+                .lock()
+                .unwrap_or_else(|p| p.into_inner());
+            if self.dds_reader.load(Ordering::Relaxed) != DDS_ENTITY_NULL {
+                return; // the listener won the race meanwhile
+            }
+            if let Err(e) = activate_dds_reader(
+                &self.dds_reader,
+                &self.ros2_name,
+                &self.ros2_type,
+                &route_id,
+                &self.context,
+                self.keyless,
+                &self._reader_qos,
+                &self._type_info,
+                &self.fwd_tx,
+                &self.dropped_msg_count,
+            ) {
+                tracing::error!("{self}: failed to re-activate DDS Reader: {e}");
+            }
+        }
     }
 
     #[inline]
