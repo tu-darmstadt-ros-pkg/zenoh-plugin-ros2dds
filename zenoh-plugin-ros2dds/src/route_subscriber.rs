@@ -396,6 +396,8 @@ fn route_zenoh_message_to_dds(
                     ros2_name,
                     len
                 );
+                // reclaim the payload buffer (was leaked on this path)
+                drop(Vec::from_raw_parts(ptr, len, capacity));
                 return;
             }
         };
@@ -416,6 +418,8 @@ fn route_zenoh_message_to_dds(
                     .to_str()
                     .unwrap_or("unrecoverable DDS retcode")
             );
+            // reclaim the payload buffer (was leaked on this path)
+            drop(Vec::from_raw_parts(ptr, len, capacity));
             return;
         }
 
@@ -437,6 +441,10 @@ fn route_zenoh_message_to_dds(
                     .to_str()
                     .unwrap_or("unrecoverable DDS retcode")
             );
+            // reclaim the payload buffer (was leaked on this path - and this
+            // path fires repeatedly under congestion, when dds_writecdr times
+            // out on a full reliable history)
+            drop(Vec::from_raw_parts(ptr, len, capacity));
             return;
         }
 

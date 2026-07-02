@@ -320,6 +320,18 @@ where
                 });
                 let qos_native = qos.to_qos_native();
                 let reader = dds_create_reader(dp, t, qos_native, std::ptr::null());
+                Qos::delete_qos_native(qos_native);
+                if reader < 0 {
+                    // Was unchecked: a negative handle flowed into get_guid
+                    // (=> retcode -3) and the route stayed permanently dead for
+                    // any topic with pub_max_frequencies configured.
+                    return Err(format!(
+                        "Error creating DDS Reader: {}",
+                        CStr::from_ptr(dds_strretcode(-reader))
+                            .to_str()
+                            .unwrap_or("unrecoverable DDS retcode")
+                    ));
+                }
                 task::spawn(async move {
                     // loop while reader's instance handle remain the same
                     // (if reader was deleted, its dds_entity_t value might have been
