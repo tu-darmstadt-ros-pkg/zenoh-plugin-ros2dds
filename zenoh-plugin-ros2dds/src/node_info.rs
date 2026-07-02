@@ -45,10 +45,6 @@ impl MsgPub {
             writers: HashSet::from([writer]),
         })
     }
-
-    pub fn name_as_keyexpr(&self) -> &keyexpr {
-        unsafe { keyexpr::from_str_unchecked(&self.name[1..]) }
-    }
 }
 
 impl std::fmt::Display for MsgPub {
@@ -81,10 +77,6 @@ impl MsgSub {
             typ,
             readers: HashSet::from([reader]),
         })
-    }
-
-    pub fn name_as_keyexpr(&self) -> &keyexpr {
-        unsafe { keyexpr::from_str_unchecked(&self.name[1..]) }
     }
 }
 
@@ -136,10 +128,6 @@ impl ServiceSrv {
             typ,
             entities: ServiceSrvEntities::default(),
         })
-    }
-
-    pub fn name_as_keyexpr(&self) -> &keyexpr {
-        unsafe { keyexpr::from_str_unchecked(&self.name[1..]) }
     }
 
     #[inline]
@@ -196,10 +184,6 @@ impl ServiceCli {
             typ,
             entities: ServiceCliEntities::default(),
         })
-    }
-
-    pub fn name_as_keyexpr(&self) -> &keyexpr {
-        unsafe { keyexpr::from_str_unchecked(&self.name[1..]) }
     }
 
     #[inline]
@@ -269,10 +253,6 @@ impl ActionSrv {
         })
     }
 
-    pub fn name_as_keyexpr(&self) -> &keyexpr {
-        unsafe { keyexpr::from_str_unchecked(&self.name[1..]) }
-    }
-
     #[inline]
     pub fn is_complete(&self) -> bool {
         self.entities.is_complete()
@@ -338,10 +318,6 @@ impl ActionCli {
             typ,
             entities: ActionCliEntities::default(),
         })
-    }
-
-    pub fn name_as_keyexpr(&self) -> &keyexpr {
-        unsafe { keyexpr::from_str_unchecked(&self.name[1..]) }
     }
 
     #[inline]
