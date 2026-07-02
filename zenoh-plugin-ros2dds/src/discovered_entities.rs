@@ -484,7 +484,9 @@ impl DiscoveredEntities {
                 tracing::debug!(
                     "ROS Node {ros_node_info} declares a not yet discovered DDS Reader: {rgid}"
                 );
-                node.undiscovered_reader.push(*rgid);
+                if !node.undiscovered_reader.contains(rgid) {
+                    node.undiscovered_reader.push(*rgid);
+                }
             }
         }
         // For each declared Writer
@@ -511,7 +513,70 @@ impl DiscoveredEntities {
                 tracing::debug!(
                     "ROS Node {ros_node_info} declares a not yet discovered DDS Writer: {wgid}"
                 );
-                node.undiscovered_writer.push(*wgid);
+                if !node.undiscovered_writer.contains(wgid) {
+                    node.undiscovered_writer.push(*wgid);
+                }
+            }
+        }
+        events
+    }
+
+    /// Resolve endpoints that a node declared in `ros_discovery_info` BEFORE
+    /// their DDS (SEDP) discovery reached us. Normally `add_reader`/`add_writer`
+    /// resolve them on arrival — but if that arrival is ever missed (burst
+    /// loss, event/channel hiccup) the endpoint stayed parked in the
+    /// `undiscovered_*` lists FOREVER and its topic was never routed
+    /// ("subscription exists, bridge never routes" - the production RViz/cloud
+    /// symptom class). Called periodically from the discovery poll as a
+    /// self-healing reconciliation.
+    pub fn resolve_pending_endpoints(&mut self) -> Vec<ROS2DiscoveryEvent> {
+        let Self {
+            writers,
+            readers,
+            nodes_info,
+            ..
+        } = self;
+        let mut events: Vec<ROS2DiscoveryEvent> = Vec::new();
+        for nodes_map in nodes_info.values_mut() {
+            for node in nodes_map.values_mut() {
+                let resolvable: Vec<Gid> = node
+                    .undiscovered_reader
+                    .iter()
+                    .filter(|gid| readers.contains_key(gid))
+                    .copied()
+                    .collect();
+                for gid in resolvable {
+                    node.undiscovered_reader.retain(|g| g != &gid);
+                    if let Some(entity) = readers.get(&gid) {
+                        tracing::info!(
+                            "Reconciliation: resolving pending Reader on {} for {}",
+                            entity.topic_name,
+                            node.fullname()
+                        );
+                        if let Some(e) = node.update_with_reader(entity) {
+                            events.push(e);
+                        }
+                    }
+                }
+                let resolvable: Vec<Gid> = node
+                    .undiscovered_writer
+                    .iter()
+                    .filter(|gid| writers.contains_key(gid))
+                    .copied()
+                    .collect();
+                for gid in resolvable {
+                    node.undiscovered_writer.retain(|g| g != &gid);
+                    if let Some(entity) = writers.get(&gid) {
+                        tracing::info!(
+                            "Reconciliation: resolving pending Writer on {} for {}",
+                            entity.topic_name,
+                            node.fullname()
+                        );
+                        if let Some(e) = node.update_with_writer(entity) {
+                            events.push(e);
+                        }
+                    }
+                }
             }
         }
         events

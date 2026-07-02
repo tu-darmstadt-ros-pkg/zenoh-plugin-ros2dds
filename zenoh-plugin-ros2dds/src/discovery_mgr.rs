@@ -135,6 +135,17 @@ impl DiscoveryMgr {
                                 }
                             }
                         }
+                        // Self-healing reconciliation: resolve endpoints whose
+                        // SEDP discovery and ros_discovery_info declaration
+                        // arrived in an order (or with losses) that parked them.
+                        {
+                            let evts = zwrite!(discovered_entities).resolve_pending_endpoints();
+                            for e in evts {
+                                if let Err(err) = evt_sender.try_send(e) {
+                                    tracing::error!("Internal error: failed to send DDSDiscoveryEvent to main loop: {err}");
+                                }
+                            }
+                        }
                         // Forward DDS Writers that no ROS node claims in ros_discovery_info
                         // (e.g. ros2_control's controller_manager/activity publisher).
                         if forward_unclaimed_publishers {

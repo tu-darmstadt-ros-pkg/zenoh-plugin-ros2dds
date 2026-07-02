@@ -36,7 +36,7 @@ use zenoh::{
     internal::{
         plugins::{RunningPlugin, RunningPluginTrait, ZenohPlugin},
         runtime::DynamicRuntime,
-        zerror, Timed,
+        zerror, Timed, TimedEvent, Timer,
     },
     key_expr::{
         format::{kedefine, keformat},
@@ -507,6 +507,17 @@ impl ROS2PluginRuntime {
             admin_prefix.clone(),
         );
 
+        // Retry machinery for failed route updates (see EVENT_RETRY_INTERVAL_MS).
+        let mut retry_queue: Vec<(ROS2DiscoveryEvent, u32)> = Vec::new();
+        let retry_timer = Timer::default();
+        let (retry_tx, retry_timer_rcv): (Sender<()>, Receiver<()>) = unbounded();
+        retry_timer
+            .add_async(TimedEvent::periodic(
+                std::time::Duration::from_millis(EVENT_RETRY_INTERVAL_MS),
+                ChannelEvent { tx: retry_tx },
+            ))
+            .await;
+
         loop {
             select!(
                 evt = discovery_rcv.recv_async() => {
@@ -514,15 +525,35 @@ impl ROS2PluginRuntime {
                         Ok(evt) => {
                             if self.is_allowed(&evt) {
                                 tracing::info!("{evt} - Allowed");
-                                // pass ROS2DiscoveryEvent to RoutesMgr
+                                // pass ROS2DiscoveryEvent to RoutesMgr; on a
+                                // transient failure keep the event for retry
+                                // instead of silently dropping the route.
+                                let retry_copy = evt.clone();
                                 if let Err(e) = routes_mgr.on_ros_discovery_event(evt).await {
-                                    tracing::warn!("Error updating route: {e}");
+                                    tracing::warn!("Error updating route: {e} - queued for retry");
+                                    retry_queue.push((retry_copy, 1));
                                 }
                             } else {
                                 tracing::debug!("{evt} - Denied per config");
                             }
                         }
                         Err(e) => tracing::error!("Internal Error: received from DiscoveryMgr: {e}")
+                    }
+                },
+
+                _ = retry_timer_rcv.recv_async() => {
+                    if !retry_queue.is_empty() {
+                        let pending = std::mem::take(&mut retry_queue);
+                        for (evt, attempts) in pending {
+                            match routes_mgr.on_ros_discovery_event(evt.clone()).await {
+                                Ok(()) => tracing::info!("{evt} - route recovered after {attempts} retry attempt(s)"),
+                                Err(e) if attempts < MAX_EVENT_RETRIES => {
+                                    tracing::debug!("{evt} - retry {attempts} failed: {e}");
+                                    retry_queue.push((evt, attempts + 1));
+                                }
+                                Err(e) => tracing::warn!("{evt} - giving up after {attempts} failed retries: {e}"),
+                            }
+                        }
                     }
                 },
 
@@ -850,6 +881,14 @@ pub fn vec_into_raw_parts<T>(v: Vec<T>) -> (*mut T, usize, usize) {
     let mut me = ManuallyDrop::new(v);
     (me.as_mut_ptr(), me.len(), me.capacity())
 }
+
+// Discovery events whose route update failed are retried on this period,
+// up to MAX_EVENT_RETRIES times. Previously a single transient failure
+// (e.g. "Failed to get DDS info" during an endpoint flap, or a DDS entity
+// creation failing under churn) silently dropped the event and the topic
+// stayed unrouted until unrelated graph changes happened to re-emit it.
+const EVENT_RETRY_INTERVAL_MS: u64 = 1000;
+const MAX_EVENT_RETRIES: u32 = 10;
 
 struct ChannelEvent {
     tx: Sender<()>,
