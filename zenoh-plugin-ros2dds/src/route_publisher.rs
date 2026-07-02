@@ -29,6 +29,7 @@ use cyclors::{
 };
 use serde::{Serialize, Serializer};
 use zenoh::{
+    bytes::ZBytes,
     key_expr::{keyexpr, OwnedKeyExpr},
     liveliness::LivelinessToken,
     matching::MatchingListener,
@@ -63,6 +64,17 @@ impl Deref for ZPublisher {
     fn deref(&self) -> &Self::Target {
         &self.publisher
     }
+}
+
+// Capacity of the per-route DDS->Zenoh forward queue. Sized to absorb multi-
+// second bursts of high-rate topics (e.g. 2.5s of a 100Hz /tf) without ever
+// blocking Cyclone's shared delivery thread.
+const FWD_QUEUE_SIZE: usize = 256;
+
+// Item of the per-route forward queue.
+enum FwdCmd {
+    Msg(ZBytes),
+    Stop,
 }
 
 // a route from DDS to Zenoh
@@ -122,6 +134,15 @@ pub struct RoutePublisher {
     // count of payload bytes successfully forwarded DDS->Zenoh by this route
     #[serde(serialize_with = "serialize_arc_atomic_u64")]
     fwd_byte_count: Arc<AtomicU64>,
+    // count of messages dropped because the forward queue was full (i.e. the
+    // zenoh side could not keep up - congested link)
+    #[serde(serialize_with = "serialize_arc_atomic_u64")]
+    dropped_msg_count: Arc<AtomicU64>,
+    // sender side of the per-route forward queue; the DDS Reader callback
+    // enqueues here, a dedicated forwarder task performs the (possibly
+    // blocking) zenoh put. See create() for the rationale.
+    #[serde(skip)]
+    fwd_tx: flume::Sender<FwdCmd>,
 }
 
 impl Drop for RoutePublisher {
@@ -136,6 +157,13 @@ impl Drop for RoutePublisher {
             }
         }
         self.deactivate_dds_reader();
+        // Stop the forwarder task. A sentinel is needed (not just dropping our
+        // sender) because cyclors leaks the reader-callback closure, which owns
+        // another sender clone. Bounded wait: if the queue is full the task is
+        // wedged in a blocking put anyway and will be reaped with the runtime.
+        let _ = self
+            .fwd_tx
+            .send_timeout(FwdCmd::Stop, Duration::from_millis(100));
     }
 }
 
@@ -247,10 +275,45 @@ impl RoutePublisher {
         // (copy/move all required args for the callback)
         let dds_reader: Arc<AtomicDDSEntity> = Arc::new(DDS_ENTITY_NULL.into());
 
-        // traffic counters (shared with the DDS Reader callback, incremented on
-        // each successful forward; surfaced in the admin space)
+        // traffic counters (incremented by the forwarder task on each
+        // successful forward; surfaced in the admin space)
         let fwd_msg_count = Arc::new(AtomicU64::new(0));
         let fwd_byte_count = Arc::new(AtomicU64::new(0));
+        let dropped_msg_count = Arc::new(AtomicU64::new(0));
+
+        // Decouple the DDS Reader callback from zenoh backpressure. The DDS
+        // listener callback runs on Cyclone's SINGLE per-domain delivery thread
+        // ("dq.user"), shared by EVERY route of this bridge: a publisher.put()
+        // blocking there on a congested link stalled all DDS->Zenoh forwarding
+        // bridge-wide (and route teardown, via dds_delete waiting for the
+        // callback). The callback now only copies the sample into this bounded
+        // queue; the forwarder task below performs the (possibly blocking) put.
+        // When the queue is full the sample is DROPPED and counted - a bounded,
+        // observable degradation instead of a bridge-wide wedge.
+        let (fwd_tx, fwd_rx) = flume::bounded::<FwdCmd>(FWD_QUEUE_SIZE);
+        {
+            let publisher = publisher.clone();
+            let fwd_msg_count = fwd_msg_count.clone();
+            let fwd_byte_count = fwd_byte_count.clone();
+            let route_id = format!("Route Publisher (ROS:{ros2_name} -> Zenoh:{zenoh_key_expr})");
+            tokio::task::spawn(async move {
+                while let Ok(cmd) = fwd_rx.recv_async().await {
+                    match cmd {
+                        FwdCmd::Msg(payload) => {
+                            let len = payload.len();
+                            if let Err(e) = publisher.put(payload).await {
+                                tracing::error!("{route_id}: failed to route message: {e}");
+                            } else {
+                                fwd_msg_count.fetch_add(1, Ordering::Relaxed);
+                                fwd_byte_count.fetch_add(len as u64, Ordering::Relaxed);
+                            }
+                        }
+                        FwdCmd::Stop => break,
+                    }
+                }
+                tracing::debug!("{route_id}: forwarder task terminated");
+            });
+        }
 
         // NOT backgrounded: the handle is stored in the RoutePublisher below so
         // it is undeclared on Drop (see field doc).
@@ -266,9 +329,8 @@ impl RoutePublisher {
                 let context = context.clone();
                 let reader_qos = reader_qos.clone();
                 let type_info = type_info.clone();
-                let publisher = publisher.clone();
-                let fwd_msg_count = fwd_msg_count.clone();
-                let fwd_byte_count = fwd_byte_count.clone();
+                let fwd_tx = fwd_tx.clone();
+                let dropped_msg_count = dropped_msg_count.clone();
 
                 move |status| {
                     tracing::debug!("{route_id} MatchingStatus changed: {status:?}");
@@ -282,9 +344,8 @@ impl RoutePublisher {
                             keyless,
                             &reader_qos,
                             &type_info,
-                            &publisher,
-                            &fwd_msg_count,
-                            &fwd_byte_count,
+                            &fwd_tx,
+                            &dropped_msg_count,
                         ) {
                             tracing::error!("{route_id}: failed to activate DDS Reader: {e}");
                         }
@@ -316,6 +377,8 @@ impl RoutePublisher {
             local_nodes: HashSet::new(),
             fwd_msg_count,
             fwd_byte_count,
+            dropped_msg_count,
+            fwd_tx,
         })
     }
 
@@ -469,9 +532,8 @@ fn activate_dds_reader(
     keyless: bool,
     reader_qos: &Qos,
     type_info: &Option<Arc<TypeInfo>>,
-    publisher: &Arc<AdvancedPublisher<'static>>,
-    fwd_msg_count: &Arc<AtomicU64>,
-    fwd_byte_count: &Arc<AtomicU64>,
+    fwd_tx: &flume::Sender<FwdCmd>,
+    dropped_msg_count: &Arc<AtomicU64>,
 ) -> Result<(), String> {
     tracing::debug!("{route_id}: create Reader with {reader_qos:?}");
     let topic_name: String = format!("rt{}", ros2_name);
@@ -489,17 +551,28 @@ fn activate_dds_reader(
         read_period,
         {
             let route_id = route_id.to_string();
-            let publisher = publisher.clone();
-            let fwd_msg_count = fwd_msg_count.clone();
-            let fwd_byte_count = fwd_byte_count.clone();
+            let fwd_tx = fwd_tx.clone();
+            let dropped_msg_count = dropped_msg_count.clone();
             move |sample: &DDSRawSample| {
-                route_dds_message_to_zenoh(
-                    sample,
-                    &publisher,
-                    &route_id,
-                    &fwd_msg_count,
-                    &fwd_byte_count,
-                );
+                // NEVER block Cyclone's shared delivery thread: enqueue only.
+                if *LOG_PAYLOAD {
+                    tracing::debug!("{route_id}: routing message - payload: {:02x?}", sample);
+                } else {
+                    tracing::trace!("{route_id}: routing message - {} bytes", sample.len());
+                }
+                match fwd_tx.try_send(FwdCmd::Msg(sample.into())) {
+                    Ok(()) => {}
+                    Err(flume::TrySendError::Full(_)) => {
+                        let n = dropped_msg_count.fetch_add(1, Ordering::Relaxed) + 1;
+                        if n == 1 || n % 100 == 0 {
+                            tracing::warn!(
+                                "{route_id}: forward queue full - {n} message(s) dropped \
+                                 since activation (zenoh side congested)"
+                            );
+                        }
+                    }
+                    Err(flume::TrySendError::Disconnected(_)) => {}
+                }
             }
         },
     )?;
@@ -543,28 +616,6 @@ fn deactivate_dds_reader(
         if let Err(e) = delete_dds_entity(reader) {
             tracing::warn!("{route_id}: error deleting DDS Reader:  {e}");
         }
-    }
-}
-
-fn route_dds_message_to_zenoh(
-    sample: &DDSRawSample,
-    publisher: &Arc<AdvancedPublisher>,
-    route_id: &str,
-    fwd_msg_count: &Arc<AtomicU64>,
-    fwd_byte_count: &Arc<AtomicU64>,
-) {
-    if *LOG_PAYLOAD {
-        tracing::debug!("{route_id}: routing message - payload: {:02x?}", sample);
-    } else {
-        tracing::trace!("{route_id}: routing message - {} bytes", sample.len());
-    }
-    let len = sample.len();
-    if let Err(e) = publisher.put(sample).wait() {
-        tracing::error!("{route_id}: failed to route message: {e}");
-    } else {
-        // count only successful forwards
-        fwd_msg_count.fetch_add(1, Ordering::Relaxed);
-        fwd_byte_count.fetch_add(len as u64, Ordering::Relaxed);
     }
 }
 

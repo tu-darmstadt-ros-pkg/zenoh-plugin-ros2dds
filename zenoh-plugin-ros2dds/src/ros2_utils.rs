@@ -23,7 +23,7 @@ use cyclors::{
     qos::{
         Durability, DurabilityKind, History, HistoryKind, IgnoreLocal, IgnoreLocalKind, Qos,
         Reliability, ReliabilityKind, TypeConsistency, TypeConsistencyKind, WriterDataLifecycle,
-        DDS_INFINITE_TIME,
+        DDS_1S_DURATION, DDS_INFINITE_TIME,
     },
 };
 use zenoh::{
@@ -311,7 +311,11 @@ fn ros2_service_default_qos() -> Qos {
         }),
         reliability: Some(Reliability {
             kind: ReliabilityKind::RELIABLE,
-            max_blocking_time: DDS_INFINITE_TIME,
+            // Bounded (was DDS_INFINITE_TIME): the bridge writes service
+            // requests/replies from zenoh callback threads; an unbounded
+            // blocking write to an unresponsive local endpoint wedged the
+            // whole RX path. 1s is far above any sane local-delivery time.
+            max_blocking_time: DDS_1S_DURATION,
         }),
         ignore_local: Some(IgnoreLocal {
             kind: IgnoreLocalKind::PARTICIPANT,
