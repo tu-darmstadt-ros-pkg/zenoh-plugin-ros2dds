@@ -24,7 +24,13 @@ pub const DEFAULT_DOMAIN: u32 = 0;
 pub const DEFAULT_RELIABLE_ROUTES_BLOCKING: bool = true;
 pub const DEFAULT_TRANSIENT_LOCAL_CACHE_MULTIPLIER: usize = 10;
 pub const DEFAULT_DDS_LOCALHOST_ONLY: bool = false;
-pub const DEFAULT_QUERIES_TIMEOUT: f32 = 5.0;
+// A service slower than this timeout EXECUTES on the server side but its
+// response is dropped by the client-side bridge (the query is finalized before
+// the reply returns) — the client hangs forever. 5.0 proved far too aggressive
+// in production (any service doing real work exceeds it); 120s matches the
+// fleet routers' queries_default_timeout. Override per-service via
+// queries_timeout.services if needed.
+pub const DEFAULT_QUERIES_TIMEOUT: f32 = 120.0;
 // In the ROS 2 action, get_result is sent out first and then wait for the result.
 // It will cause the action client never complete, so we need a larger timeout.
 // Refer to https://github.com/eclipse-zenoh/zenoh-plugin-ros2dds/issues/369#issuecomment-2563725619

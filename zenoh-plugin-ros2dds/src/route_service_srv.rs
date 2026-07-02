@@ -144,7 +144,10 @@ impl RouteServiceSrv {
         let user_data = format!("clientid= {client_id_str};");
         qos.user_data = Some(user_data.into_bytes());
 
-        // create DDS Writer to send requests coming from Zenoh to the Service
+        // create DDS Writer (requests) + DDS Reader (replies). Build both and read
+        // back their GUIDs into locals first, deleting on any failure (e.g.
+        // transient BAD_PARAMETER under participant churn) so we never leak an
+        // entity or build a half-created route.
         let req_topic_name = format!("rq{ros2_name}Request");
         let req_type_name = ros2_service_type_to_request_dds_type(&ros2_type);
         let req_writer = create_dds_writer(
@@ -154,14 +157,23 @@ impl RouteServiceSrv {
             true,
             qos.clone(),
         )?;
-        // add writer's GID in ros_discovery_info message
-        context
-            .ros_discovery_mgr
-            .add_dds_writer(get_guid(&req_writer)?);
+        let writer_gid = match get_guid(&req_writer) {
+            Ok(gid) => gid,
+            Err(e) => {
+                let _ = delete_dds_entity(req_writer);
+                return Err(e);
+            }
+        };
 
         // client_guid used in requests; use dds_instance_handle of writer as rmw_cyclonedds here:
         // https://github.com/ros2/rmw_cyclonedds/blob/2263814fab142ac19dd3395971fb1f358d22a653/rmw_cyclonedds_cpp/src/rmw_node.cpp#L4848
-        let client_guid = get_instance_handle(req_writer)?;
+        let client_guid = match get_instance_handle(req_writer) {
+            Ok(h) => h,
+            Err(e) => {
+                let _ = delete_dds_entity(req_writer);
+                return Err(e);
+            }
+        };
 
         tracing::debug!(
             "{route_id}: (local client_guid={client_guid:02x?})  id='{client_id_str}' => USER_DATA={:?}",
@@ -175,7 +187,7 @@ impl RouteServiceSrv {
         // create DDS Reader to receive replies and route them to Zenoh
         let rep_topic_name = format!("rr{ros2_name}Reply");
         let rep_type_name = ros2_service_type_to_reply_dds_type(&ros2_type);
-        let rep_reader = create_dds_reader(
+        let rep_reader = match create_dds_reader(
             context.participant,
             rep_topic_name,
             rep_type_name,
@@ -195,11 +207,29 @@ impl RouteServiceSrv {
                     );
                 }
             },
-        )?;
-        // add reader's GID in ros_discovery_info message
-        context
-            .ros_discovery_mgr
-            .add_dds_reader(get_guid(&rep_reader)?);
+        ) {
+            Ok(r) => r,
+            Err(e) => {
+                // reader creation failed — delete the writer created above.
+                let _ = delete_dds_entity(req_writer);
+                return Err(e);
+            }
+        };
+        let reader_gid = match get_guid(&rep_reader) {
+            Ok(gid) => gid,
+            Err(e) => {
+                let _ = delete_dds_entity(rep_reader);
+                let _ = delete_dds_entity(req_writer);
+                return Err(e);
+            }
+        };
+
+        // Both entities and both GUIDs succeeded — only now register them in the
+        // ros_discovery_info message. Registering the writer GID earlier would
+        // leave a dangling GID advertised if a later step (reader creation/GUID)
+        // failed and deleted the writer without unregistering it.
+        context.ros_discovery_mgr.add_dds_writer(writer_gid);
+        context.ros_discovery_mgr.add_dds_reader(reader_gid);
 
         Ok(RouteServiceSrv {
             ros2_name,

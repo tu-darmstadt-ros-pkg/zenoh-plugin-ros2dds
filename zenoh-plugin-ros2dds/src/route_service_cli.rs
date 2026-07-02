@@ -17,7 +17,7 @@ use std::{
     fmt,
     sync::{
         atomic::{AtomicBool, Ordering},
-        Arc,
+        Arc, Mutex,
     },
     time::Duration,
 };
@@ -86,6 +86,14 @@ pub struct RouteServiceCli {
     // re-activate its DDS entities when a remote server reconnects (see add_remote_route)
     #[serde(skip)]
     _type_info: Option<Arc<TypeInfo>>,
+    // Serializes activate()/deactivate() across their three unsynchronized
+    // callers (matching-listener callback on a zenoh thread, add_remote_route
+    // re-activation on the routes-mgr task, deactivate on retire/prune/Drop).
+    // Without it, two concurrent activations can commit a MISMATCHED pair:
+    // a live request reader whose callback captured an already-deleted reply
+    // writer - requests then execute but replies go to a dead entity.
+    #[serde(skip)]
+    activation_lock: Arc<Mutex<()>>,
     // a liveliness token associated to this route, for announcement to other plugins
     #[serde(skip)]
     liveliness_token: Option<LivelinessToken>,
@@ -151,6 +159,7 @@ impl RouteServiceCli {
         // (copy/move all required args for the callback)
         let rep_writer: Arc<AtomicDDSEntity> = Arc::new(DDS_ENTITY_NULL.into());
         let req_reader: Arc<AtomicDDSEntity> = Arc::new(DDS_ENTITY_NULL.into());
+        let activation_lock: Arc<Mutex<()>> = Arc::new(Mutex::new(()));
 
         // NOT backgrounded: the handle is stored in the RouteServiceCli below so
         // it is undeclared on Drop (see field doc).
@@ -164,9 +173,13 @@ impl RouteServiceCli {
                 let context = context.clone();
                 let zquerier = zenoh_querier.clone();
                 let type_info = type_info.clone();
+                let activation_lock = activation_lock.clone();
 
                 move |status| {
                         tracing::debug!("{route_id} MatchingStatus changed: {status:?}");
+                        // Serialize with the other activation/deactivation paths
+                        // (survive poisoning: state is the atomics, not the guard).
+                        let _guard = activation_lock.lock().unwrap_or_else(|p| p.into_inner());
                         if status.matching() {
                             if let Err(e) = activate(
                                 &rep_writer,
@@ -204,6 +217,7 @@ impl RouteServiceCli {
             req_reader,
             _matching_listener: Some(matching_listener),
             _type_info: type_info,
+            activation_lock,
             liveliness_token: None,
             remote_routes: HashSet::new(),
             local_nodes: HashSet::new(),
@@ -246,6 +260,10 @@ impl RouteServiceCli {
 
     fn deactivate(&mut self) {
         let route_id = self.to_string();
+        let _guard = self
+            .activation_lock
+            .lock()
+            .unwrap_or_else(|p| p.into_inner());
         deactivate(
             &self.rep_writer,
             &self.req_reader,
@@ -270,6 +288,15 @@ impl RouteServiceCli {
             match self._zenoh_querier.matching_status().wait() {
                 Ok(status) if status.matching() => {
                     let route_id = self.to_string();
+                    // Serialize with the matching-listener callback; re-check
+                    // under the lock (the listener may have activated already).
+                    let _guard = self
+                        .activation_lock
+                        .lock()
+                        .unwrap_or_else(|p| p.into_inner());
+                    if self.req_reader.load(Ordering::Relaxed) != DDS_ENTITY_NULL {
+                        return;
+                    }
                     if let Err(e) = activate(
                         &self.rep_writer,
                         &self.req_reader,
@@ -366,6 +393,14 @@ fn activate(
     type_info: &Option<Arc<TypeInfo>>,
     zenoh_querier: &Arc<Querier<'static>>,
 ) -> Result<(), String> {
+    // Already fully active (both entities committed): nothing to do. Callers
+    // hold the activation lock, so this check cannot race another activation.
+    if rep_writer.load(Ordering::Relaxed) != DDS_ENTITY_NULL
+        && req_reader.load(Ordering::Relaxed) != DDS_ENTITY_NULL
+    {
+        tracing::debug!("{route_id}: already active - skipping re-activation");
+        return Ok(());
+    }
     tracing::debug!("{route_id}: activate");
     // Default Service QoS
     let mut qos = QOS_DEFAULT_SERVICE.clone();
@@ -380,9 +415,28 @@ fn activate(
         qos.user_data.as_ref().unwrap()
     );
 
+    // Activation is transactional: build BOTH entities and fetch their GUIDs into
+    // locals first; only publish them into the atomics once everything succeeds.
+    // If any step fails (e.g. get_guid returns BAD_PARAMETER under participant
+    // churn), delete whatever was created and return Err with the atomics left
+    // untouched (still NULL). This prevents a half-activated route — a writer
+    // live but reader absent, or both live while the route reports inactive —
+    // which would otherwise leak entities and leave a "listed but dead" route.
+
     // create DDS Writer to send replies coming from Zenoh to the Client
     let rep_topic_name = format!("rr{}Reply", ros2_name);
     let rep_type_name = ros2_service_type_to_reply_dds_type(ros2_type);
+    // create DDS Reader to receive requests and route them to Zenoh
+    let req_topic_name = format!("rq{}Request", ros2_name);
+    let req_type_name = ros2_service_type_to_request_dds_type(ros2_type);
+
+    // Build both entities and read back their GUIDs into locals first; only
+    // publish them into the atomics once everything succeeds. On any failure
+    // (e.g. transient BAD_PARAMETER under participant churn), delete whatever was
+    // created and return Err with the atomics left untouched — preventing a
+    // half-activated route (writer live but reader absent, or both live while the
+    // route reports inactive) that would leak entities and leave a "listed but
+    // dead" route. The route then re-activates via the normal recovery paths.
     let dds_writer = create_dds_writer(
         context.participant,
         rep_topic_name,
@@ -390,27 +444,17 @@ fn activate(
         true,
         qos.clone(),
     )?;
-    let old = rep_writer.swap(dds_writer, Ordering::Relaxed);
-    if old != DDS_ENTITY_NULL {
-        tracing::warn!(
-            "{route_id}: on activation their was already a DDS Reply Writer - overwrite it"
-        );
-        if let Err(e) = delete_dds_entity(old) {
-            tracing::warn!("{route_id}: failed to delete overwritten DDS Reply Writer: {e}");
+    let writer_gid = match get_guid(&dds_writer) {
+        Ok(gid) => gid,
+        Err(e) => {
+            let _ = delete_dds_entity(dds_writer);
+            return Err(e);
         }
-    }
+    };
 
-    // add writer's GID in ros_discovery_info message
-    context
-        .ros_discovery_mgr
-        .add_dds_writer(get_guid(&dds_writer)?);
-
-    // create DDS Reader to receive requests and route them to Zenoh
-    let req_topic_name = format!("rq{}Request", ros2_name);
-    let req_type_name = ros2_service_type_to_request_dds_type(ros2_type);
     let zquerier = zenoh_querier.clone();
     let route_id2 = route_id.to_owned();
-    let dds_reader = create_dds_reader(
+    let dds_reader = match create_dds_reader(
         context.participant,
         req_topic_name,
         req_type_name,
@@ -421,7 +465,36 @@ fn activate(
         move |sample| {
             route_dds_request_to_zenoh(&route_id2, sample, &zquerier, dds_writer);
         },
-    )?;
+    ) {
+        Ok(r) => r,
+        Err(e) => {
+            let _ = delete_dds_entity(dds_writer);
+            return Err(e);
+        }
+    };
+    let reader_gid = match get_guid(&dds_reader) {
+        Ok(gid) => gid,
+        Err(e) => {
+            let _ = delete_dds_entity(dds_reader);
+            let _ = delete_dds_entity(dds_writer);
+            return Err(e);
+        }
+    };
+
+    // Everything succeeded — commit. Register GIDs and publish into the atomics,
+    // deleting any pre-existing entities we overwrite.
+    context.ros_discovery_mgr.add_dds_writer(writer_gid);
+    let old = rep_writer.swap(dds_writer, Ordering::Relaxed);
+    if old != DDS_ENTITY_NULL {
+        tracing::warn!(
+            "{route_id}: on activation their was already a DDS Reply Writer - overwrite it"
+        );
+        if let Err(e) = delete_dds_entity(old) {
+            tracing::warn!("{route_id}: failed to delete overwritten DDS Reply Writer: {e}");
+        }
+    }
+
+    context.ros_discovery_mgr.add_dds_reader(reader_gid);
     let old = req_reader.swap(dds_reader, Ordering::Relaxed);
     if old != DDS_ENTITY_NULL {
         tracing::warn!(
@@ -431,11 +504,6 @@ fn activate(
             tracing::warn!("{route_id}: failed to delete overwritten DDS Request Reader: {e}");
         }
     }
-
-    // add reader's GID in ros_discovery_info message
-    context
-        .ros_discovery_mgr
-        .add_dds_reader(get_guid(&dds_reader)?);
 
     Ok(())
 }
