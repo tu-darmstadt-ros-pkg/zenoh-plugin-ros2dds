@@ -20,7 +20,7 @@ use zenoh::key_expr::OwnedKeyExpr;
 use crate::node_info::*;
 
 /// A (local) discovery event of a ROS2 interface
-#[derive(Debug)]
+#[derive(Clone, Debug)]
 pub enum ROS2DiscoveryEvent {
     DiscoveredMsgPub(String, MsgPub),
     UndiscoveredMsgPub(String, MsgPub),

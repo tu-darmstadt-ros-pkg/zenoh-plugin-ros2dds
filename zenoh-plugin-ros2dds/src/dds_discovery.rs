@@ -81,54 +81,63 @@ unsafe extern "C" fn on_data(dr: dds_entity_t, arg: *mut std::os::raw::c_void) {
         [std::ptr::null_mut(); MAX_SAMPLES];
     samples[0] = std::ptr::null_mut();
 
-    let n = dds_take(
-        dr,
-        samples.as_mut_ptr(),
-        si.as_mut_ptr() as *mut dds_sample_info_t,
-        MAX_SAMPLES,
-        MAX_SAMPLES as u32,
-    );
-    let si = si.assume_init();
+    // Take until the reader cache is EMPTY. The DATA_AVAILABLE listener is
+    // edge-triggered: samples left behind by a single bounded take were only
+    // delivered when the next unrelated sample arrived (or never), silently
+    // losing discovery of endpoints created in bursts larger than one batch.
+    loop {
+        let n = dds_take(
+            dr,
+            samples.as_mut_ptr(),
+            si.as_mut_ptr() as *mut dds_sample_info_t,
+            MAX_SAMPLES,
+            MAX_SAMPLES as u32,
+        );
+        if n <= 0 {
+            break;
+        }
+        let si = si.assume_init();
 
-    for i in 0..n {
-        match discovery_type {
-            DiscoveryType::Publication | DiscoveryType::Subscription => {
-                let sample = samples[i as usize] as *mut dds_builtintopic_endpoint_t;
-                if (*sample).participant_instance_handle == dpih {
-                    // Ignore discovery of entities created by our own participant
-                    continue;
-                }
-                let is_alive = si[i as usize].instance_state == dds_instance_state_DDS_IST_ALIVE;
-                let key: Gid = (*sample).key.v.into();
-
-                if is_alive {
-                    let topic_name = match CStr::from_ptr((*sample).topic_name).to_str() {
-                        Ok(s) => s,
-                        Err(e) => {
-                            tracing::warn!("Discovery of an invalid topic name: {}", e);
-                            continue;
-                        }
-                    };
-                    if topic_name.starts_with("DCPS") {
-                        tracing::debug!(
-                            "Ignoring discovery of {} ({} is a builtin topic)",
-                            key,
-                            topic_name
-                        );
+        for i in 0..n {
+            match discovery_type {
+                DiscoveryType::Publication | DiscoveryType::Subscription => {
+                    let sample = samples[i as usize] as *mut dds_builtintopic_endpoint_t;
+                    if (*sample).participant_instance_handle == dpih {
+                        // Ignore discovery of entities created by our own participant
                         continue;
                     }
+                    let is_alive =
+                        si[i as usize].instance_state == dds_instance_state_DDS_IST_ALIVE;
+                    let key: Gid = (*sample).key.v.into();
 
-                    let type_name = match CStr::from_ptr((*sample).type_name).to_str() {
-                        Ok(s) => s,
-                        Err(e) => {
-                            tracing::warn!("Discovery of an invalid topic type: {}", e);
+                    if is_alive {
+                        let topic_name = match CStr::from_ptr((*sample).topic_name).to_str() {
+                            Ok(s) => s,
+                            Err(e) => {
+                                tracing::warn!("Discovery of an invalid topic name: {}", e);
+                                continue;
+                            }
+                        };
+                        if topic_name.starts_with("DCPS") {
+                            tracing::debug!(
+                                "Ignoring discovery of {} ({} is a builtin topic)",
+                                key,
+                                topic_name
+                            );
                             continue;
                         }
-                    };
-                    let participant_key = (*sample).participant_key.v.into();
-                    let keyless = (*sample).key.v[15] == 3 || (*sample).key.v[15] == 4;
 
-                    tracing::debug!(
+                        let type_name = match CStr::from_ptr((*sample).type_name).to_str() {
+                            Ok(s) => s,
+                            Err(e) => {
+                                tracing::warn!("Discovery of an invalid topic type: {}", e);
+                                continue;
+                            }
+                        };
+                        let participant_key = (*sample).participant_key.v.into();
+                        let keyless = (*sample).key.v[15] == 3 || (*sample).key.v[15] == 4;
+
+                        tracing::debug!(
                         "Discovered DDS {} {} from Participant {} on {} with type {} (keyless: {})",
                         discovery_type,
                         key,
@@ -138,102 +147,107 @@ unsafe extern "C" fn on_data(dr: dds_entity_t, arg: *mut std::os::raw::c_void) {
                         keyless
                     );
 
-                    let mut type_info: *const dds_typeinfo_t = std::ptr::null();
-                    let ret = dds_builtintopic_get_endpoint_type_info(sample, &mut type_info);
+                        let mut type_info: *const dds_typeinfo_t = std::ptr::null();
+                        let ret = dds_builtintopic_get_endpoint_type_info(sample, &mut type_info);
 
-                    let type_info = match ret {
-                        0 => match type_info.is_null() {
-                            false => Some(Arc::new(TypeInfo::new(type_info))),
-                            true => {
-                                tracing::trace!(
-                                    "Type information not available for type {}",
-                                    type_name
+                        let type_info = match ret {
+                            0 => match type_info.is_null() {
+                                false => Some(Arc::new(TypeInfo::new(type_info))),
+                                true => {
+                                    tracing::trace!(
+                                        "Type information not available for type {}",
+                                        type_name
+                                    );
+                                    None
+                                }
+                            },
+                            _ => {
+                                tracing::warn!(
+                                    "Failed to lookup type information({})",
+                                    CStr::from_ptr(dds_strretcode(ret))
+                                        .to_str()
+                                        .unwrap_or("unrecoverable DDS retcode")
                                 );
                                 None
                             }
-                        },
-                        _ => {
-                            tracing::warn!(
-                                "Failed to lookup type information({})",
-                                CStr::from_ptr(dds_strretcode(ret))
-                                    .to_str()
-                                    .unwrap_or("unrecoverable DDS retcode")
+                        };
+
+                        // send a DDSDiscoveryEvent
+                        let entity = DdsEntity {
+                            key,
+                            participant_key,
+                            topic_name: String::from(topic_name),
+                            type_name: String::from(type_name),
+                            keyless,
+                            _type_info: type_info,
+                            qos: Qos::from_qos_native((*sample).qos),
+                        };
+
+                        if let DiscoveryType::Publication = discovery_type {
+                            send_discovery_event(
+                                sender,
+                                DDSDiscoveryEvent::DiscoveredPublication { entity },
                             );
-                            None
+                        } else {
+                            send_discovery_event(
+                                sender,
+                                DDSDiscoveryEvent::DiscoveredSubscription { entity },
+                            );
                         }
-                    };
-
-                    // send a DDSDiscoveryEvent
-                    let entity = DdsEntity {
-                        key,
-                        participant_key,
-                        topic_name: String::from(topic_name),
-                        type_name: String::from(type_name),
-                        keyless,
-                        _type_info: type_info,
-                        qos: Qos::from_qos_native((*sample).qos),
-                    };
-
-                    if let DiscoveryType::Publication = discovery_type {
+                    } else if let DiscoveryType::Publication = discovery_type {
                         send_discovery_event(
                             sender,
-                            DDSDiscoveryEvent::DiscoveredPublication { entity },
+                            DDSDiscoveryEvent::UndiscoveredPublication { key },
                         );
                     } else {
                         send_discovery_event(
                             sender,
-                            DDSDiscoveryEvent::DiscoveredSubscription { entity },
+                            DDSDiscoveryEvent::UndiscoveredSubscription { key },
                         );
                     }
-                } else if let DiscoveryType::Publication = discovery_type {
-                    send_discovery_event(
-                        sender,
-                        DDSDiscoveryEvent::UndiscoveredPublication { key },
-                    );
-                } else {
-                    send_discovery_event(
-                        sender,
-                        DDSDiscoveryEvent::UndiscoveredSubscription { key },
-                    );
                 }
-            }
-            DiscoveryType::Participant => {
-                let sample = samples[i as usize] as *mut dds_builtintopic_participant_t;
-                let is_alive = si[i as usize].instance_state == dds_instance_state_DDS_IST_ALIVE;
-                let key: Gid = (*sample).key.v.into();
+                DiscoveryType::Participant => {
+                    let sample = samples[i as usize] as *mut dds_builtintopic_participant_t;
+                    let is_alive =
+                        si[i as usize].instance_state == dds_instance_state_DDS_IST_ALIVE;
+                    let key: Gid = (*sample).key.v.into();
 
-                let mut guid = dds_builtintopic_guid { v: [0; 16] };
-                let _ = dds_get_guid(dp, &mut guid);
-                let guid = guid.v.into();
+                    let mut guid = dds_builtintopic_guid { v: [0; 16] };
+                    let _ = dds_get_guid(dp, &mut guid);
+                    let guid = guid.v.into();
 
-                if key == guid {
-                    // Ignore discovery of entities created by our own participant
-                    continue;
-                }
+                    if key == guid {
+                        // Ignore discovery of entities created by our own participant
+                        continue;
+                    }
 
-                if is_alive {
-                    tracing::debug!("Discovered DDS Participant {})", key,);
+                    if is_alive {
+                        tracing::debug!("Discovered DDS Participant {})", key,);
 
-                    // Send a DDSDiscoveryEvent
-                    let entity = DdsParticipant {
-                        key,
-                        qos: Qos::from_qos_native((*sample).qos),
-                    };
+                        // Send a DDSDiscoveryEvent
+                        let entity = DdsParticipant {
+                            key,
+                            qos: Qos::from_qos_native((*sample).qos),
+                        };
 
-                    send_discovery_event(
-                        sender,
-                        DDSDiscoveryEvent::DiscoveredParticipant { entity },
-                    );
-                } else {
-                    send_discovery_event(
-                        sender,
-                        DDSDiscoveryEvent::UndiscoveredParticipant { key },
-                    );
+                        send_discovery_event(
+                            sender,
+                            DDSDiscoveryEvent::DiscoveredParticipant { entity },
+                        );
+                    } else {
+                        send_discovery_event(
+                            sender,
+                            DDSDiscoveryEvent::UndiscoveredParticipant { key },
+                        );
+                    }
                 }
             }
         }
+        dds_return_loan(dr, samples.as_mut_ptr(), n);
+        if (n as usize) < MAX_SAMPLES {
+            break; // cache drained
+        }
     }
-    dds_return_loan(dr, samples.as_mut_ptr(), MAX_SAMPLES as i32);
     let _ = Box::into_raw(btx);
 }
 
