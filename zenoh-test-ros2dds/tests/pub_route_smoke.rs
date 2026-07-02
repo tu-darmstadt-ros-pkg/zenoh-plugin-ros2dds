@@ -90,7 +90,9 @@ async fn dds_to_zenoh_route_forwards_and_counts() {
 
     // Admin space: the route must expose the forward counters.
     let routes = common::fetch_routes(&session, "topic/pub").await;
+    println!("admin space: {} publisher routes", routes.len());
     let route = routes.get("smoke_topic");
+    println!("smoke_topic route JSON: {route:?}");
     let fwd = route
         .and_then(|r| r.get("fwd_msg_count"))
         .and_then(|v| v.as_u64())

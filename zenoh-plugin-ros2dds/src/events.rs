@@ -56,6 +56,33 @@ impl std::fmt::Display for ROS2DiscoveryEvent {
     }
 }
 
+impl ROS2DiscoveryEvent {
+    /// (node fullname, interface kind, interface name) identifying WHAT this
+    /// event is about, ignoring the discovered/undiscovered direction. A newer
+    /// event with the same key supersedes any older one still waiting in the
+    /// retry queue (see lib.rs): retrying a stale Discovered after its
+    /// interface was undiscovered would create a ghost route nothing retires.
+    pub fn interface_key(&self) -> (&str, &'static str, &str) {
+        use ROS2DiscoveryEvent::*;
+        match self {
+            DiscoveredMsgPub(node, i) | UndiscoveredMsgPub(node, i) => (node, "MsgPub", &i.name),
+            DiscoveredMsgSub(node, i) | UndiscoveredMsgSub(node, i) => (node, "MsgSub", &i.name),
+            DiscoveredServiceSrv(node, i) | UndiscoveredServiceSrv(node, i) => {
+                (node, "ServiceSrv", &i.name)
+            }
+            DiscoveredServiceCli(node, i) | UndiscoveredServiceCli(node, i) => {
+                (node, "ServiceCli", &i.name)
+            }
+            DiscoveredActionSrv(node, i) | UndiscoveredActionSrv(node, i) => {
+                (node, "ActionSrv", &i.name)
+            }
+            DiscoveredActionCli(node, i) | UndiscoveredActionCli(node, i) => {
+                (node, "ActionCli", &i.name)
+            }
+        }
+    }
+}
+
 /// A (remote) announcement/retirement of a ROS2 interface
 #[derive(Debug)]
 pub enum ROS2AnnouncementEvent {

@@ -509,6 +509,13 @@ impl ROS2PluginRuntime {
 
         // Retry machinery for failed route updates (see EVENT_RETRY_INTERVAL_MS).
         let mut retry_queue: Vec<(ROS2DiscoveryEvent, u32)> = Vec::new();
+        // Transport-loss prunes are DEFERRED one retry tick: the Delete event
+        // is broadcast BEFORE the transport is removed from the session's
+        // transport map, so an immediate peers_zid()/routers_zid() check could
+        // see the dying transport as "reconnected" and skip a needed prune.
+        // One tick later the map reflects reality (and genuine fast reconnects
+        // are correctly detected and spared).
+        let mut pending_prunes: Vec<(zenoh::session::ZenohId, String)> = Vec::new();
         let retry_timer = Timer::default();
         let (retry_tx, retry_timer_rcv): (Sender<()>, Receiver<()>) = unbounded();
         retry_timer
@@ -525,6 +532,12 @@ impl ROS2PluginRuntime {
                         Ok(evt) => {
                             if self.is_allowed(&evt) {
                                 tracing::info!("{evt} - Allowed");
+                                // This event supersedes any queued retry about
+                                // the same interface: replaying a stale
+                                // Discovered after an Undiscovered (or after an
+                                // orphan->real transfer) would create a ghost
+                                // route that nothing ever retires.
+                                retry_queue.retain(|(q, _)| q.interface_key() != evt.interface_key());
                                 // pass ROS2DiscoveryEvent to RoutesMgr; on a
                                 // transient failure keep the event for retry
                                 // instead of silently dropping the route.
@@ -542,6 +555,25 @@ impl ROS2PluginRuntime {
                 },
 
                 _ = retry_timer_rcv.recv_async() => {
+                    if !pending_prunes.is_empty() {
+                        for (zid, zenoh_id) in std::mem::take(&mut pending_prunes) {
+                            // Stale-event guard (evaluated one tick after the
+                            // Delete, when the transport map is settled): if
+                            // the peer already reconnected, pruning would tear
+                            // down freshly rebuilt routes with nothing left to
+                            // rebuild them. NOTE: client-mode peers never appear
+                            // in these iterators - for them the prune always
+                            // proceeds (production bridges run as routers).
+                            let reconnected = self.zsession.info().peers_zid().await.any(|z| z == zid)
+                                || self.zsession.info().routers_zid().await.any(|z| z == zid);
+                            if reconnected {
+                                tracing::info!("Remote zenoh transport {zenoh_id} re-established - NOT pruning its routes");
+                            } else {
+                                tracing::info!("Remote zenoh transport {zenoh_id} gone - pruning its routes");
+                                routes_mgr.on_remote_bridge_left(&zenoh_id);
+                            }
+                        }
+                    }
                     if !retry_queue.is_empty() {
                         let pending = std::mem::take(&mut retry_queue);
                         for (evt, attempts) in pending {
@@ -617,18 +649,9 @@ impl ROS2PluginRuntime {
                             if evt.kind() == SampleKind::Delete {
                                 let zid = *evt.transport().zid();
                                 let zenoh_id = zid.to_string();
-                                // Stale-event guard: transport events and the
-                                // peer's (re-)announcements arrive on separate
-                                // channels. If the peer already reconnected,
-                                // pruning now would tear down freshly rebuilt
-                                // routes with nothing left to rebuild them.
-                                let reconnected = self.zsession.info().peers_zid().await.any(|z| z == zid)
-                                    || self.zsession.info().routers_zid().await.any(|z| z == zid);
-                                if reconnected {
-                                    tracing::info!("Remote zenoh transport lost: {zenoh_id} - already re-established, NOT pruning");
-                                } else {
-                                    tracing::info!("Remote zenoh transport lost: {zenoh_id} - pruning its routes");
-                                    routes_mgr.on_remote_bridge_left(&zenoh_id);
+                                tracing::info!("Remote zenoh transport lost: {zenoh_id} - prune scheduled");
+                                if !pending_prunes.iter().any(|(z, _)| *z == zid) {
+                                    pending_prunes.push((zid, zenoh_id));
                                 }
                             }
                         }
