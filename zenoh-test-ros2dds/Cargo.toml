@@ -17,6 +17,7 @@ edition = "2021"
 
 [dependencies]
 cdr = "0.2.4"
+cyclors = "0.2.7"
 futures = "0.3.26"
 r2r = "0.9.5"
 serde = "1.0.219"

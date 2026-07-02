@@ -497,6 +497,13 @@ impl ROS2PluginRuntime {
             .await
             .expect("Failed to create transport events listener");
 
+        // Channel for RouteSubscriber publication-matched events (DDS-level
+        // local-interest detection, independent of the ROS graph).
+        let (matched_reader_tx, matched_reader_rcv): (
+            Sender<(String, bool)>,
+            Receiver<(String, bool)>,
+        ) = unbounded();
+
         // Create RoutesManager
         let mut routes_mgr = RoutesMgr::new(
             self.config.clone(),
@@ -505,6 +512,7 @@ impl ROS2PluginRuntime {
             discovery_mgr.discovered_entities.clone(),
             ros_discovery_mgr,
             admin_prefix.clone(),
+            matched_reader_tx,
         );
 
         // Retry machinery for failed route updates (see EVENT_RETRY_INTERVAL_MS).
@@ -551,6 +559,12 @@ impl ROS2PluginRuntime {
                             }
                         }
                         Err(e) => tracing::error!("Internal Error: received from DiscoveryMgr: {e}")
+                    }
+                },
+
+                matched_evt = matched_reader_rcv.recv_async() => {
+                    if let Ok((ros2_name, matched)) = matched_evt {
+                        routes_mgr.on_matched_reader_event(ros2_name, matched).await;
                     }
                 },
 

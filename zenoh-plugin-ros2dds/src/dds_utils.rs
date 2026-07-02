@@ -68,6 +68,61 @@ pub fn ddsrt_iov_len_from_usize(len: usize) -> Result<ddsrt_iov_len_t, String> {
         .map_err(|e| format!("INTERNAL ERROR converting a usize to ddsrt_iov_len_t: {e}"))
 }
 
+unsafe extern "C" fn publication_matched_trampoline<F>(
+    _writer: dds_entity_t,
+    status: dds_publication_matched_status,
+    arg: *mut std::os::raw::c_void,
+) where
+    F: Fn(u32) + Send + Sync + 'static,
+{
+    let cb = &*(arg as *const F);
+    cb(status.current_count);
+}
+
+/// Attach a PUBLICATION_MATCHED listener to an existing DDS Writer and invoke
+/// `callback` with the current matched-reader count on every change (plus once
+/// immediately, covering matches that happened before attachment).
+///
+/// Rationale: routes must serve local DDS readers even when their node never
+/// declares them in `ros_discovery_info` (observed in production for hector-UI
+/// subscriptions and ros2_control endpoints, visible as `_NODE_NAME_UNKNOWN_`
+/// in `ros2 topic info -v`). DDS-level matching is authoritative; the ROS
+/// graph is best-effort.
+///
+/// Note: like the reader-callback closure, the boxed callback is leaked (the
+/// listener lives until the writer is deleted; Cyclone gives no reclaim hook
+/// here). The writer's QoS must carry `ignore_local: PARTICIPANT` so the
+/// bridge's own readers never count.
+pub fn attach_publication_matched_listener<F>(
+    writer: dds_entity_t,
+    callback: F,
+) -> Result<(), String>
+where
+    F: Fn(u32) + Send + Sync + 'static,
+{
+    unsafe {
+        let arg = Box::into_raw(Box::new(callback));
+        let listener = dds_create_listener(arg as *mut std::os::raw::c_void);
+        dds_lset_publication_matched(listener, Some(publication_matched_trampoline::<F>));
+        let ret = dds_set_listener(writer, listener);
+        if ret < 0 {
+            return Err(format!(
+                "Error attaching publication-matched listener: {}",
+                CStr::from_ptr(dds_strretcode(-ret))
+                    .to_str()
+                    .unwrap_or("unrecoverable DDS retcode")
+            ));
+        }
+        // Deliver the initial state (matches that occurred before attachment).
+        let mut status: dds_publication_matched_status = std::mem::zeroed();
+        if dds_get_publication_matched_status(writer, &mut status) >= 0 {
+            let cb = &*(arg as *const F);
+            cb(status.current_count);
+        }
+        Ok(())
+    }
+}
+
 pub fn delete_dds_entity(entity: dds_entity_t) -> Result<(), String> {
     unsafe {
         let r = dds_delete(entity);

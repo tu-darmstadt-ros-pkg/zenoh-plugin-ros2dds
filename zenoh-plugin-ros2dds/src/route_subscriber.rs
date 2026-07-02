@@ -39,8 +39,8 @@ use zenoh_ext::{AdvancedSubscriber, AdvancedSubscriberBuilderExt, HistoryConfig}
 
 use crate::{
     dds_utils::{
-        create_dds_writer, ddsrt_iov_len_from_usize, delete_dds_entity, get_guid,
-        serialize_entity_guid,
+        attach_publication_matched_listener, create_dds_writer, ddsrt_iov_len_from_usize,
+        delete_dds_entity, get_guid, serialize_entity_guid,
     },
     liveliness_mgt::new_ke_liveliness_sub,
     qos::{History, Qos},
@@ -55,6 +55,11 @@ enum ZSubscriber {
     Subscriber(Subscriber<()>),
     AdvancedSubscriber(AdvancedSubscriber<()>),
 }
+
+/// Synthetic local_nodes entry representing "at least one DDS reader is
+/// matched with this route's writer", used when the reader's node never
+/// declares it in ros_discovery_info (see attach_publication_matched_listener).
+const MATCHED_READERS_KEY: &str = "<matched_dds_readers>";
 
 // a route from Zenoh to DDS
 #[allow(clippy::upper_case_acronyms)]
@@ -73,6 +78,9 @@ pub struct RouteSubscriber {
     // `None` when route is created on a remote announcement and no local ROS2 Subscriber discovered yet
     #[serde(rename = "is_active", serialize_with = "serialize_option_as_bool")]
     zenoh_subscriber: Option<ZSubscriber>,
+    // QoS used when announcing the route on matched-reader activation
+    #[serde(skip)]
+    announce_qos: Qos,
     // the local DDS Writer created to serve the route (i.e. re-publish to DDS message coming from zenoh)
     #[serde(serialize_with = "serialize_entity_guid")]
     dds_writer: dds_entity_t,
@@ -154,6 +162,7 @@ impl RouteSubscriber {
         tracing::debug!(
             "Route Subscriber ({zenoh_key_expr} -> {ros2_name}): create Writer with {writer_qos:?}"
         );
+        let announce_qos = writer_qos.clone();
         let dds_writer = create_dds_writer(
             context.participant,
             topic_name,
@@ -173,12 +182,33 @@ impl RouteSubscriber {
         };
         context.ros_discovery_mgr.add_dds_writer(writer_gid);
 
+        // DDS-level local-interest detection: activate this route for ANY
+        // matched reader, whether or not its node declares it in
+        // ros_discovery_info (hector-UI subscriptions and ros2_control
+        // endpoints show up as _NODE_NAME_UNKNOWN_ and were never served).
+        // ignore_local=PARTICIPANT on the writer QoS excludes the bridge's
+        // own readers, so no self-activation loop is possible.
+        {
+            let cb_name = ros2_name.clone();
+            let tx = context.matched_reader_tx.clone();
+            if let Err(e) = attach_publication_matched_listener(dds_writer, move |count| {
+                let _ = tx.try_send((cb_name.clone(), count > 0));
+            }) {
+                tracing::warn!(
+                    "Route Subscriber (Zenoh -> ROS:{ros2_name}): cannot attach \
+                     publication-matched listener (undeclared local readers will \
+                     not be served): {e}"
+                );
+            }
+        }
+
         Ok(RouteSubscriber {
             ros2_name,
             ros2_type,
             zenoh_key_expr,
             context,
             zenoh_subscriber: None,
+            announce_qos,
             dds_writer,
             transient_local,
             queries_timeout,
@@ -338,6 +368,30 @@ impl RouteSubscriber {
         tracing::debug!("{self} now serving local nodes {:?}", self.local_nodes);
         // if last local node removed, deactivate the route
         if self.local_nodes.is_empty() {
+            self.retire_route();
+        }
+    }
+
+    /// DDS-level matched-reader state changed (publication-matched listener).
+    /// A matched reader is authoritative local interest even when its node
+    /// never declares it in ros_discovery_info: represent it as a synthetic
+    /// local_nodes entry so the usual announce/retire lifecycle applies.
+    pub async fn update_matched_readers(&mut self, matched: bool) {
+        if matched {
+            if self.local_nodes.insert(MATCHED_READERS_KEY.to_string()) {
+                tracing::debug!("{self} now serving matched (possibly undeclared) DDS readers");
+                if self.local_nodes.len() == 1 {
+                    tracing::info!(
+                        "{self}: activating for matched DDS reader(s) not declared by any ROS node"
+                    );
+                    let qos = self.announce_qos.clone();
+                    if let Err(e) = self.announce_route(&qos).await {
+                        tracing::error!("{self} activation failed: {e}");
+                    }
+                }
+            }
+        } else if self.local_nodes.remove(MATCHED_READERS_KEY) && self.local_nodes.is_empty() {
+            tracing::info!("{self}: last matched DDS reader gone - retiring");
             self.retire_route();
         }
     }
