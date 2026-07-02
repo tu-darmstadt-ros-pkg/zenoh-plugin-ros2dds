@@ -693,6 +693,130 @@ mod tests {
             .unwrap_or(false);
         assert!(!real_owns, "real node must not also own the Writer");
     }
+
+    fn writer_of(participant: Gid, gid: u8, topic: &str) -> DdsEntity {
+        DdsEntity {
+            key: Gid::from([gid; 16]),
+            participant_key: participant,
+            topic_name: topic.to_string(),
+            type_name: "std_msgs::msg::dds_::String_".to_string(),
+            _type_info: None,
+            keyless: true,
+            qos: Qos::default(),
+        }
+    }
+
+    // Returns the node fullname in an UndiscoveredMsgPub event.
+    fn unpub_node(event: &ROS2DiscoveryEvent) -> &str {
+        match event {
+            ROS2DiscoveryEvent::UndiscoveredMsgPub(node, _) => node,
+            other => panic!("expected UndiscoveredMsgPub, got {other:?}"),
+        }
+    }
+
+    /// CLAIM (audit finding, seen live on /tf in production): all participants'
+    /// orphan nodes share the single fullname "/_zenoh_orphan_endpoints_". A
+    /// route's `local_nodes` is a HashSet of fullnames, so N orphan-claimed
+    /// co-publishers collapse into ONE entry — and the first participant whose
+    /// writer disappears emits an UndiscoveredMsgPub for that shared name,
+    /// which empties `local_nodes` at the routes level and tears the route
+    /// down while other participants still publish. No later sweep ever
+    /// re-emits a DiscoveredMsgPub, so the route never comes back.
+    ///
+    /// This test PASSES while the bug exists (it verifies the claim); after a
+    /// fix (participant-unique orphan identity, or re-forward after teardown)
+    /// its final two assertions are expected to fail and it should be updated.
+    #[test]
+    fn claim_shared_topic_orphan_collision_tears_down_and_never_recovers() {
+        let p1 = Gid::from([1; 16]);
+        let p2 = Gid::from([2; 16]);
+        let mut entities = DiscoveredEntities::default();
+
+        // Two participants each publish rt/tf; neither is declared by any node.
+        let w1 = writer_of(p1, 40, "rt/tf");
+        let w1gid = w1.key;
+        entities.add_writer(w1);
+        entities.add_writer(writer_of(p2, 41, "rt/tf"));
+
+        // Both are orphan-forwarded — under the SAME node fullname.
+        let events = entities.forward_orphan_writers();
+        assert_eq!(events.len(), 2);
+        let orphan_fullname = format!("/{ORPHAN_NODE_NAME}");
+        assert_eq!(pub_node(&events[0]), orphan_fullname);
+        assert_eq!(pub_node(&events[1]), orphan_fullname);
+        // Identical fullnames => at the routes level local_nodes (a HashSet of
+        // fullnames) holds ONE entry for two live publishers.
+
+        // Participant 1's writer disappears (node restart / crash).
+        let event = entities
+            .remove_writer(&w1gid)
+            .expect("removal of an orphan-owned writer must emit an event");
+        // CLAIM: an UndiscoveredMsgPub for the SHARED fullname is emitted even
+        // though participant 2 still publishes rt/tf. routes_mgr will remove
+        // the only local_nodes entry and retire/remove the still-needed route.
+        assert_eq!(unpub_node(&event), orphan_fullname);
+
+        // CLAIM: no recovery — p2's orphan node still holds rt/tf in msg_pub,
+        // so the sweep's update_with_writer returns None forever: no event
+        // will ever re-create the torn-down route.
+        assert!(
+            entities.forward_orphan_writers().is_empty(),
+            "sweep must not re-forward (this is the no-recovery half of the bug)"
+        );
+    }
+
+    /// CLAIM (audit finding, seen live in production logs 2026-07-02): writers
+    /// on node-internal standard topics (rosout, parameter_events) are NOT
+    /// excluded from orphan forwarding, so any node whose ros_discovery_info
+    /// is merely late gets its rosout/parameter_events writers permanently
+    /// claimed by the synthetic orphan node.
+    #[test]
+    fn claim_rosout_and_parameter_events_are_orphan_forwarded() {
+        let mut entities = DiscoveredEntities::default();
+        entities.add_writer(writer(50, "rt/rosout"));
+        entities.add_writer(writer(51, "rt/parameter_events"));
+
+        let events = entities.forward_orphan_writers();
+        assert_eq!(
+            events.len(),
+            2,
+            "rosout/parameter_events are claimed by the orphan sweep (the claim); \
+             an exclusion-list fix should make this 0"
+        );
+    }
+
+    /// CLAIM (audit finding, seen live: joy writer claimed 100ms before its
+    /// node's ros_discovery_info in production logs): the sweep has no grace
+    /// period — a writer whose owning node's ros_discovery_info has simply not
+    /// arrived YET (participant completely unknown to ros_discovery) is
+    /// claimed immediately and stays misattributed after the node declares it.
+    #[test]
+    fn claim_no_grace_period_for_participants_without_any_rdi() {
+        let mut entities = DiscoveredEntities::default();
+        // DDS discovery of the writer arrives; the participant has never sent
+        // any ros_discovery_info (its rdi is in flight).
+        entities.add_writer(writer(60, "rt/joy"));
+
+        // One sweep tick later (100ms in production) the writer is claimed,
+        // even though nothing indicates its node won't declare it momentarily.
+        let events = entities.forward_orphan_writers();
+        assert_eq!(events.len(), 1);
+        assert_eq!(pub_node(&events[0]), format!("/{ORPHAN_NODE_NAME}"));
+
+        // The real node's declaration arrives one poll tick later — too late:
+        // it is skipped (sticky rule), the misattribution is permanent.
+        let mut node_info = NodeEntitiesInfo::new("/".to_string(), "joy_node".to_string());
+        node_info.writer_gid_seq.insert(Gid::from([60; 16]));
+        let mut part_info = ParticipantEntitiesInfo::new(participant());
+        part_info
+            .node_entities_info_seq
+            .insert(node_info.full_name(), node_info);
+        let events = entities.update_participant_info(part_info);
+        assert!(
+            events.is_empty(),
+            "late-by-one-tick declaration is ignored; writer stays on the orphan node"
+        );
+    }
 }
 
 // Remove any null QoS values from a serde_json::Value
