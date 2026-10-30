@@ -33,7 +33,9 @@ use crate::{
     config::Config,
     discovered_entities::DiscoveredEntities,
     events::{ROS2AnnouncementEvent, ROS2DiscoveryEvent},
-    qos_helpers::{adapt_reader_qos_for_writer, adapt_writer_qos_for_reader},
+    qos_helpers::{
+        adapt_reader_qos_for_writer, adapt_writer_qos_for_reader, announced_qos_for_local_writers,
+    },
     ros2_utils::{key_expr_to_ros2_name, ros2_name_to_key_expr},
     ros_discovery::RosDiscoveryInfoMgr,
     route_action_cli::RouteActionCli,
@@ -153,17 +155,22 @@ impl RoutesMgr {
                 };
                 match entity {
                     Some(entity) => {
+                        let local_writers = self.local_writers_qos(&iface.name);
                         // Get route (create it if not yet exists)
                         let route = self
                             .get_or_create_route_publisher(
                                 iface.name,
                                 iface.typ,
                                 entity.keyless,
+                                &local_writers,
                                 adapt_writer_qos_for_reader(&entity.qos),
                                 true,
                             )
                             .await?;
-                        route.add_local_node(node, &entity.qos).await;
+                        route
+                            .add_local_node(node, &announced_qos_for_local_writers(&local_writers))
+                            .await;
+                        route.update_local_writers(&local_writers).await?;
                     }
                     None => {
                         return Err(format!(
@@ -175,6 +182,7 @@ impl RoutesMgr {
             }
 
             UndiscoveredMsgPub(node, iface) => {
+                let local_writers = self.local_writers_qos(&iface.name);
                 if let Entry::Occupied(mut entry) = self.routes_publishers.entry(iface.name.clone())
                 {
                     let route = entry.get_mut();
@@ -186,6 +194,8 @@ impl RoutesMgr {
                         );
                         let route = entry.remove();
                         tracing::info!("{route} removed");
+                    } else {
+                        route.update_local_writers(&local_writers).await?;
                     }
                 }
             }
@@ -351,7 +361,7 @@ impl RoutesMgr {
                     kind: cyclors::qos::IgnoreLocalKind::PARTICIPANT,
                 });
                 // On remote Publisher route announcement, prepare a Subscriber route
-                // with an associated DDS Writer allowing local ROS2 Nodes to discover it
+                // with an associated DDS Writer allowing local ROS2 Nodes to discover it.
                 let route = self
                     .get_or_create_route_subscriber(
                         key_expr_to_ros2_name(&zenoh_key_expr, &self.context.config),
@@ -361,24 +371,30 @@ impl RoutesMgr {
                         true,
                     )
                     .await?;
-                route.add_remote_route(&zenoh_id, &zenoh_key_expr);
+                route
+                    .add_remote_publisher(&zenoh_id, &zenoh_key_expr, keyless, &writer_qos)
+                    .await?;
             }
 
             RetiredMsgPub {
                 zenoh_id,
                 zenoh_key_expr,
+                keyless,
+                writer_qos,
             } => {
                 // Convert zenoh key_expr to ROS2 name (same as when creating the route)
                 let ros2_name = key_expr_to_ros2_name(&zenoh_key_expr, &self.context.config);
 
                 if let Entry::Occupied(mut entry) = self.routes_subscribers.entry(ros2_name) {
                     let route = entry.get_mut();
-                    route.remove_remote_route(&zenoh_id, &zenoh_key_expr);
+                    route.remove_remote_publisher(&zenoh_id, &zenoh_key_expr, keyless, &writer_qos);
                     if route.is_unused() {
                         self.admin_space
                             .remove(&(*KE_PREFIX_ROUTE_SUBSCRIBER / &zenoh_key_expr));
                         let route = entry.remove();
                         tracing::info!("{route} removed");
+                    } else {
+                        route.update_writer().await?;
                     }
                 }
             }
@@ -395,12 +411,16 @@ impl RoutesMgr {
                     kind: cyclors::qos::IgnoreLocalKind::PARTICIPANT,
                 });
                 // On remote Subscriber route announcement, prepare a Publisher route
-                // with an associated DDS Reader allowing local ROS2 Nodes to discover it
+                // with an associated DDS Reader allowing local ROS2 Nodes to discover it.
+                // Its QoS follows the local Writers, the remote QoS only provides the type hash.
+                let ros2_name = key_expr_to_ros2_name(&zenoh_key_expr, &self.context.config);
+                let local_writers = self.local_writers_qos(&ros2_name);
                 let route = self
                     .get_or_create_route_publisher(
-                        key_expr_to_ros2_name(&zenoh_key_expr, &self.context.config),
+                        ros2_name,
                         ros2_type,
                         keyless,
+                        &local_writers,
                         qos,
                         true,
                     )
@@ -588,6 +608,16 @@ impl RoutesMgr {
         // route creation, and later matches re-fire the listener.
     }
 
+    /// Re-derive every topic subscriber route's DDS Writer from its remaining
+    /// remote publishers (after `on_remote_bridge_left` pruned some).
+    pub async fn update_subscriber_writers(&mut self) {
+        for route in self.routes_subscribers.values_mut() {
+            if let Err(e) = route.update_writer().await {
+                tracing::warn!("{route}: failed to adapt DDS Writer to remaining publishers: {e}");
+            }
+        }
+    }
+
     /// A remote bridge's zenoh transport was lost (its session dropped). On an
     /// UNGRACEFUL loss (WiFi drop, peer crash/restart) the per-announcement
     /// Retired* liveliness events are NOT delivered, so each route's
@@ -625,12 +655,18 @@ impl RoutesMgr {
         prune_map!(self.routes_action_cli, *KE_PREFIX_ROUTE_ACTION_CLI);
     }
 
+    /// QoS of all local (non-bridge) DDS Writers of the ROS topic `ros2_name`.
+    fn local_writers_qos(&self, ros2_name: &str) -> Vec<Qos> {
+        zread!(self.context.discovered_entities).writers_qos_on_topic(&format!("rt{ros2_name}"))
+    }
+
     async fn get_or_create_route_publisher(
         &mut self,
         ros2_name: String,
         ros2_type: String,
         keyless: bool,
-        reader_qos: Qos,
+        local_writers: &[Qos],
+        fallback_qos: Qos,
         admin_space_ref: bool,
     ) -> Result<&mut RoutePublisher, String> {
         match self.routes_publishers.entry(ros2_name.clone()) {
@@ -638,13 +674,13 @@ impl RoutesMgr {
                 // ROS2 topic name => Zenoh key expr
                 let zenoh_key_expr = ros2_name_to_key_expr(&ros2_name, &self.context.config);
                 // create route
-                let route = RoutePublisher::create(
+                let route = RoutePublisher::create_for_topic(
                     ros2_name.clone(),
                     ros2_type,
                     zenoh_key_expr.clone(),
-                    &None,
                     keyless,
-                    reader_qos,
+                    local_writers,
+                    fallback_qos,
                     self.context.clone(),
                 )
                 .await?;
@@ -668,20 +704,20 @@ impl RoutesMgr {
         ros2_name: String,
         ros2_type: String,
         keyless: bool,
-        writer_qos: Qos,
+        announce_qos: Qos,
         admin_space_ref: bool,
     ) -> Result<&mut RouteSubscriber, String> {
         match self.routes_subscribers.entry(ros2_name.clone()) {
             Entry::Vacant(entry) => {
                 // ROS2 topic name => Zenoh key expr
                 let zenoh_key_expr = ros2_name_to_key_expr(&ros2_name, &self.context.config);
-                // create route
-                let route = RouteSubscriber::create(
+                // create route (its DDS Writer comes with the first remote publisher)
+                let route = RouteSubscriber::create_for_topic(
                     ros2_name.clone(),
                     ros2_type,
                     zenoh_key_expr.clone(),
                     keyless,
-                    writer_qos,
+                    announce_qos,
                     self.context.clone(),
                 )
                 .await?;

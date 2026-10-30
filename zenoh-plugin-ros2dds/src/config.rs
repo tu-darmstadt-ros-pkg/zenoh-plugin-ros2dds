@@ -22,7 +22,7 @@ pub const DEFAULT_NAMESPACE: &str = "/";
 pub const DEFAULT_NODENAME: &str = "zenoh_bridge_ros2dds";
 pub const DEFAULT_DOMAIN: u32 = 0;
 pub const DEFAULT_RELIABLE_ROUTES_BLOCKING: bool = true;
-pub const DEFAULT_TRANSIENT_LOCAL_CACHE_MULTIPLIER: usize = 10;
+pub const DEFAULT_TRANSIENT_LOCAL_CACHE_MULTIPLIER: usize = 25;
 pub const DEFAULT_DDS_LOCALHOST_ONLY: bool = false;
 // A service slower than this timeout EXECUTES on the server side but its
 // response is dropped by the client-side bridge (the query is finalized before
@@ -997,5 +997,12 @@ mod tests {
             ros_static_peers, ..
         } = config.unwrap();
         assert_eq!(ros_static_peers, result);
+    }
+
+    #[test]
+    fn test_transient_local_cache_multiplier_default() {
+        // 25 >= the number of static_transform_publishers a typical robot runs
+        let config = serde_json::from_str::<Config>("{}").unwrap();
+        assert_eq!(config.transient_local_cache_multiplier, 25);
     }
 }

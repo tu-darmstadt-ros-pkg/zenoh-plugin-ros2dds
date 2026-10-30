@@ -113,11 +113,38 @@ where
                     .unwrap_or("unrecoverable DDS retcode")
             ));
         }
-        // Deliver the initial state (matches that occurred before attachment).
+        // Deliver matches made before attachment, a 0 would retire a route whose readers are still matching a rebuilt Writer
         let mut status: dds_publication_matched_status = std::mem::zeroed();
-        if dds_get_publication_matched_status(writer, &mut status) >= 0 {
+        if dds_get_publication_matched_status(writer, &mut status) >= 0
+            && status.current_count > 0
+        {
             let cb = &*(arg as *const F);
             cb(status.current_count);
+        }
+        Ok(())
+    }
+}
+
+/// Current number of Readers matched with `writer` (None on error).
+pub fn publication_matched_count(writer: dds_entity_t) -> Option<u32> {
+    unsafe {
+        let mut status: dds_publication_matched_status = std::mem::zeroed();
+        (dds_get_publication_matched_status(writer, &mut status) >= 0).then_some(status.current_count)
+    }
+}
+
+/// Remove any listener from `entity` (e.g. before deleting it, so that its
+/// teardown does not fire callbacks).
+pub fn detach_listener(entity: dds_entity_t) -> Result<(), String> {
+    unsafe {
+        let ret = dds_set_listener(entity, std::ptr::null());
+        if ret < 0 {
+            return Err(format!(
+                "Error detaching listener: {}",
+                CStr::from_ptr(dds_strretcode(-ret))
+                    .to_str()
+                    .unwrap_or("unrecoverable DDS retcode")
+            ));
         }
         Ok(())
     }

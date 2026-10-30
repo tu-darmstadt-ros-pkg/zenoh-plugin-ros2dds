@@ -84,7 +84,7 @@ impl ROS2DiscoveryEvent {
 }
 
 /// A (remote) announcement/retirement of a ROS2 interface
-#[derive(Debug)]
+#[derive(Clone, Debug)]
 pub enum ROS2AnnouncementEvent {
     AnnouncedMsgPub {
         zenoh_id: OwnedKeyExpr,
@@ -96,6 +96,10 @@ pub enum ROS2AnnouncementEvent {
     RetiredMsgPub {
         zenoh_id: OwnedKeyExpr,
         zenoh_key_expr: OwnedKeyExpr,
+        // the QoS of the retired announcement: a route re-announcing with a
+        // new QoS declares the new token before retiring the old one
+        keyless: bool,
+        writer_qos: Qos,
     },
     AnnouncedMsgSub {
         zenoh_id: OwnedKeyExpr,

@@ -237,6 +237,18 @@ impl DiscoveredEntities {
         self.writers.get(gid)
     }
 
+    /// QoS of every discovered (i.e. non-bridge) DDS Writer on `topic_name`,
+    /// in GID order so that QoS derived from them is deterministic.
+    pub fn writers_qos_on_topic(&self, topic_name: &str) -> Vec<cyclors::qos::Qos> {
+        let mut writers: Vec<&DdsEntity> = self
+            .writers
+            .values()
+            .filter(|w| w.topic_name == topic_name)
+            .collect();
+        writers.sort_by_key(|w| w.key.to_string());
+        writers.into_iter().map(|w| w.qos.clone()).collect()
+    }
+
     #[inline]
     pub fn remove_writer(&mut self, gid: &Gid) -> Option<ROS2DiscoveryEvent> {
         if let Some(writer) = self.writers.remove(gid) {

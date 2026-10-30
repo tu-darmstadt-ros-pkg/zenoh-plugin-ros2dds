@@ -517,6 +517,8 @@ impl ROS2PluginRuntime {
 
         // Retry machinery for failed route updates (see EVENT_RETRY_INTERVAL_MS).
         let mut retry_queue: Vec<(ROS2DiscoveryEvent, u32)> = Vec::new();
+        // topic announcements are one-shot liveliness events, so failed ones are retried too
+        let mut announcement_retry_queue: Vec<(ROS2AnnouncementEvent, u32)> = Vec::new();
         // Transport-loss prunes are DEFERRED one retry tick: the Delete event
         // is broadcast BEFORE the transport is removed from the session's
         // transport map, so an immediate peers_zid()/routers_zid() check could
@@ -585,6 +587,26 @@ impl ROS2PluginRuntime {
                             } else {
                                 tracing::info!("Remote zenoh transport {zenoh_id} gone - pruning its routes");
                                 routes_mgr.on_remote_bridge_left(&zenoh_id);
+                                // a queued retry must not resurrect the departed bridge's routes
+                                let (mp, ms) = (format!("MP:{zenoh_id}:"), format!("MS:{zenoh_id}:"));
+                                announcement_retry_queue.retain(|(q, _)| {
+                                    msg_route_id(q).is_none_or(|id| !id.starts_with(&mp) && !id.starts_with(&ms))
+                                });
+                                // re-derive Writers from the remaining remote publishers
+                                routes_mgr.update_subscriber_writers().await;
+                            }
+                        }
+                    }
+                    if !announcement_retry_queue.is_empty() {
+                        let pending = std::mem::take(&mut announcement_retry_queue);
+                        for (evt, attempts) in pending {
+                            match routes_mgr.on_ros_announcement_event(evt.clone()).await {
+                                Ok(()) => tracing::info!("{evt} - route recovered after {attempts} retry attempt(s)"),
+                                Err(e) if attempts < MAX_EVENT_RETRIES => {
+                                    tracing::debug!("{evt} - retry {attempts} failed: {e}");
+                                    announcement_retry_queue.push((evt, attempts + 1));
+                                }
+                                Err(e) => tracing::warn!("{evt} - giving up after {attempts} failed retries: {e}"),
                             }
                         }
                     }
@@ -635,8 +657,19 @@ impl ROS2PluginRuntime {
                                             Ok(evt) => {
                                                 if self.is_announcement_allowed(&evt) {
                                                     tracing::info!("Remote bridge {zenoh_id} {evt} - Allowed");
-                                                    routes_mgr.on_ros_announcement_event(evt).await
-                                                        .unwrap_or_else(|e| tracing::warn!("Error treating announcement event: {e}"));
+                                                    // a newer event about the same remote route supersedes a queued retry
+                                                    if let Some(id) = msg_route_id(&evt) {
+                                                        announcement_retry_queue.retain(|(q, _)| msg_route_id(q).as_ref() != Some(&id));
+                                                    }
+                                                    let retry_copy = evt.clone();
+                                                    if let Err(e) = routes_mgr.on_ros_announcement_event(evt).await {
+                                                        if msg_route_id(&retry_copy).is_some() {
+                                                            tracing::warn!("Error treating announcement event: {e} - queued for retry");
+                                                            announcement_retry_queue.push((retry_copy, 1));
+                                                        } else {
+                                                            tracing::warn!("Error treating announcement event: {e}");
+                                                        }
+                                                    }
                                                 } else {
                                                     tracing::debug!("Remote bridge {zenoh_id} {evt} - Matching entity denied per config");
                                                 }
@@ -710,9 +743,11 @@ impl ROS2PluginRuntime {
                 ),
             ("MP/", SampleKind::Delete) => parse_ke_liveliness_pub(liveliness_ke)
                 .map_err(|e| format!("Received invalid liveliness token: {e}"))
-                .map(|(zenoh_id, zenoh_key_expr, ..)| RetiredMsgPub {
+                .map(|(zenoh_id, zenoh_key_expr, _, keyless, writer_qos)| RetiredMsgPub {
                     zenoh_id,
                     zenoh_key_expr,
+                    keyless,
+                    writer_qos,
                 }),
             ("MS/", SampleKind::Put) => parse_ke_liveliness_sub(liveliness_ke)
                 .map_err(|e| format!("Received invalid liveliness token: {e}"))
@@ -964,4 +999,96 @@ where
     S: Serializer,
 {
     s.serialize_bool(opt.is_some())
+}
+
+/// Retry identity of a topic announcement, None for other kinds.
+/// Publisher ids include the QoS, the Delete of a re-announced route must not supersede the new Put.
+fn msg_route_id(evt: &ROS2AnnouncementEvent) -> Option<String> {
+    use ROS2AnnouncementEvent::*;
+    match evt {
+        AnnouncedMsgPub {
+            zenoh_id,
+            zenoh_key_expr,
+            keyless,
+            writer_qos,
+            ..
+        }
+        | RetiredMsgPub {
+            zenoh_id,
+            zenoh_key_expr,
+            keyless,
+            writer_qos,
+        } => Some(format!(
+            "MP:{zenoh_id}:{zenoh_key_expr}:{}",
+            liveliness_mgt::qos_to_key_expr(*keyless, writer_qos)
+        )),
+        AnnouncedMsgSub {
+            zenoh_id,
+            zenoh_key_expr,
+            ..
+        }
+        | RetiredMsgSub {
+            zenoh_id,
+            zenoh_key_expr,
+        } => Some(format!("MS:{zenoh_id}:{zenoh_key_expr}")),
+        _ => None,
+    }
+}
+
+#[cfg(test)]
+mod msg_route_id_tests {
+    use super::*;
+    use cyclors::qos::{Durability, DurabilityKind, Qos};
+    use zenoh::key_expr::OwnedKeyExpr;
+
+    fn ke(s: &str) -> OwnedKeyExpr {
+        OwnedKeyExpr::try_from(s.to_string()).unwrap()
+    }
+    fn qos(tl: bool) -> Qos {
+        Qos {
+            durability: Some(Durability {
+                kind: if tl {
+                    DurabilityKind::TRANSIENT_LOCAL
+                } else {
+                    DurabilityKind::VOLATILE
+                },
+            }),
+            ..Default::default()
+        }
+    }
+    fn put(tl: bool) -> ROS2AnnouncementEvent {
+        ROS2AnnouncementEvent::AnnouncedMsgPub {
+            zenoh_id: ke("z1"),
+            zenoh_key_expr: ke("topic"),
+            ros2_type: "std_msgs/msg/String".into(),
+            keyless: true,
+            writer_qos: qos(tl),
+        }
+    }
+    fn delete(tl: bool) -> ROS2AnnouncementEvent {
+        ROS2AnnouncementEvent::RetiredMsgPub {
+            zenoh_id: ke("z1"),
+            zenoh_key_expr: ke("topic"),
+            keyless: true,
+            writer_qos: qos(tl),
+        }
+    }
+
+    #[test]
+    fn reannouncement_delete_does_not_supersede_new_put() {
+        // make-before-break: Put(new QoS) then Delete(old QoS)
+        assert_ne!(msg_route_id(&put(true)), msg_route_id(&delete(false)));
+        assert_eq!(msg_route_id(&put(true)), msg_route_id(&delete(true)));
+    }
+
+    #[test]
+    fn publisher_and_subscriber_ids_do_not_collide() {
+        let sub = ROS2AnnouncementEvent::RetiredMsgSub {
+            zenoh_id: ke("z1"),
+            zenoh_key_expr: ke("topic"),
+        };
+        assert_ne!(msg_route_id(&sub), msg_route_id(&delete(false)));
+        assert!(msg_route_id(&sub).unwrap().starts_with("MS:z1:"));
+        assert!(msg_route_id(&put(false)).unwrap().starts_with("MP:z1:"));
+    }
 }

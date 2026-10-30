@@ -166,8 +166,10 @@
       ////                                   The cache size must be at least equal to the Publisher's `history_length` QoS setting.
       ////                                   Since the plugin creates one route per topic, the route might serve multiple Publishers.
       ////                                   Therefore, the `PublicationCache` size is calculated as `history_length * transient_local_cache_multiplier`.
-      ////                                   If there are more than 10 `TRANSIENT_LOCAL` Publishers on the same topic, consider increasing this multiplier.
-      // transient_local_cache_multiplier: 10,
+      ////                                   The same factor sizes the history the remote bridge's DDS Writer keeps for late joiner Subscribers
+      ////                                   (e.g. a late RViz must still receive every /tf_static transform).
+      ////                                   If there are more than 25 `TRANSIENT_LOCAL` Publishers on the same topic, consider increasing this multiplier.
+      // transient_local_cache_multiplier: 25,
 
       ////
       //// This plugin uses Tokio (https://tokio.rs/) for asynchronous programming. 
