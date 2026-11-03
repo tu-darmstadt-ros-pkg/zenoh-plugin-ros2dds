@@ -651,14 +651,12 @@ impl ROS2PluginRuntime {
                                     // the liveliness token corresponds to a ROS2 announcement
                                     (Some(remaining), _) => {
                                         // parse it and pass ROS2AnnouncementEvent to RoutesMgr
-                                        // A malformed/foreign token with a <3 byte
-                                        // suffix must not panic the plugin task.
-                                        let remaining_str = remaining.as_str();
-                                        if remaining_str.len() < 3 {
-                                            tracing::warn!("Ignoring liveliness token with unexpected short suffix: {ke}");
+                                        // a foreign token must not panic the plugin task
+                                        let Some(prefix) = remaining.as_str().get(..3) else {
+                                            tracing::warn!("Ignoring liveliness token with unexpected suffix: {ke}");
                                             continue;
-                                        }
-                                        match self.parse_announcement_event(ke, &remaining_str[..3], evt.kind()) {
+                                        };
+                                        match self.parse_announcement_event(ke, prefix, evt.kind()) {
                                             Ok(evt) => {
                                                 if self.is_announcement_allowed(&evt) {
                                                     tracing::info!("Remote bridge {zenoh_id} {evt} - Allowed");
