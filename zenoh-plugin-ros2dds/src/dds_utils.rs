@@ -84,11 +84,9 @@ unsafe extern "C" fn publication_matched_trampoline<F>(
 /// `callback` with the current matched-reader count on every change (plus once
 /// immediately, covering matches that happened before attachment).
 ///
-/// Rationale: routes must serve local DDS readers even when their node never
-/// declares them in `ros_discovery_info` (observed in production for hector-UI
-/// subscriptions and ros2_control endpoints, visible as `_NODE_NAME_UNKNOWN_`
-/// in `ros2 topic info -v`). DDS-level matching is authoritative; the ROS
-/// graph is best-effort.
+/// Routes must serve local DDS readers that their node never declares in `ros_discovery_info`,
+/// shown as `_NODE_NAME_UNKNOWN_` by `ros2 topic info -v` (e.g. ros2_control endpoints).
+/// DDS matching is authoritative, the ROS graph is best effort.
 ///
 /// Note: like the reader-callback closure, the boxed callback is leaked (the
 /// listener lives until the writer is deleted; Cyclone gives no reclaim hook

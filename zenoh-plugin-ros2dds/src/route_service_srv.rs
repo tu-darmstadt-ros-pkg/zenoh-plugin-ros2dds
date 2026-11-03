@@ -212,7 +212,7 @@ impl RouteServiceSrv {
         ) {
             Ok(r) => r,
             Err(e) => {
-                // reader creation failed — delete the writer created above.
+                // reader creation failed, delete the writer created above
                 let _ = delete_dds_entity(req_writer);
                 return Err(e);
             }
@@ -226,10 +226,7 @@ impl RouteServiceSrv {
             }
         };
 
-        // Both entities and both GUIDs succeeded — only now register them in the
-        // ros_discovery_info message. Registering the writer GID earlier would
-        // leave a dangling GID advertised if a later step (reader creation/GUID)
-        // failed and deleted the writer without unregistering it.
+        // registered only now, so a failed step never leaves a GID advertised in ros_discovery_info
         context.ros_discovery_mgr.add_dds_writer(writer_gid);
         context.ros_discovery_mgr.add_dds_reader(reader_gid);
 
@@ -472,10 +469,7 @@ fn route_zenoh_request_to_dds(
         );
     }
 
-    // Insert (and lazily GC abandoned entries) under a SHORT lock, then write
-    // to DDS with NO lock held: dds_write can block on a full reliable history,
-    // and the reply-reader callback (on Cyclone's shared delivery thread) takes
-    // this same lock - holding it across the write wedged all DDS delivery.
+    // dds_write can block on a full history while the reply callback on Cyclone's delivery thread needs this lock
     let inserted_at = Instant::now();
     {
         let mut qip = zwrite!(queries_in_progress);
@@ -490,9 +484,7 @@ fn route_zenoh_request_to_dds(
     }
     if let Err(e) = dds_write(req_writer, dds_req_buf) {
         tracing::warn!("{route_id}: routing request from Zenoh to DDS failed: {e}");
-        // Remove only OUR entry: a concurrent retry with the same request_id
-        // (attachment-provided ids are not unique across retries) may have
-        // replaced it after a SUCCESSFUL write - its reply must still resolve.
+        // a retry reusing the request_id may have replaced our entry and still awaits its reply
         let mut qip = zwrite!(queries_in_progress);
         if qip
             .get(&request_id)

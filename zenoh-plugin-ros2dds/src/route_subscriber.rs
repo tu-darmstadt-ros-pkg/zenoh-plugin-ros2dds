@@ -305,12 +305,8 @@ impl RouteSubscriber {
     fn install_writer(&mut self, qos: Qos) -> Result<(), String> {
         let writer = self.create_writer(&qos)?;
 
-        // DDS-level local-interest detection: activate this route for ANY
-        // matched reader, whether or not its node declares it in
-        // ros_discovery_info (hector-UI subscriptions and ros2_control
-        // endpoints show up as _NODE_NAME_UNKNOWN_ and were never served).
-        // ignore_local=PARTICIPANT on the writer QoS excludes the bridge's
-        // own readers, so no self-activation loop is possible.
+        // Any matched reader activates the route, also readers absent from ros_discovery_info.
+        // ignore_local=PARTICIPANT keeps the bridge's own readers from activating it.
         {
             let cb_name = self.ros2_name.clone();
             let tx = self.context.matched_reader_tx.clone();
@@ -718,7 +714,7 @@ fn route_zenoh_message_to_dds(
                     ros2_name,
                     len
                 );
-                // reclaim the payload buffer (was leaked on this path)
+                // reclaim the payload buffer
                 drop(Vec::from_raw_parts(ptr, len, capacity));
                 return;
             }
@@ -740,7 +736,7 @@ fn route_zenoh_message_to_dds(
                     .to_str()
                     .unwrap_or("unrecoverable DDS retcode")
             );
-            // reclaim the payload buffer (was leaked on this path)
+            // reclaim the payload buffer
             drop(Vec::from_raw_parts(ptr, len, capacity));
             return;
         }
@@ -763,9 +759,7 @@ fn route_zenoh_message_to_dds(
                     .to_str()
                     .unwrap_or("unrecoverable DDS retcode")
             );
-            // reclaim the payload buffer (was leaked on this path - and this
-            // path fires repeatedly under congestion, when dds_writecdr times
-            // out on a full reliable history)
+            // reclaim the payload buffer, dds_writecdr times out repeatedly under congestion
             drop(Vec::from_raw_parts(ptr, len, capacity));
             return;
         }

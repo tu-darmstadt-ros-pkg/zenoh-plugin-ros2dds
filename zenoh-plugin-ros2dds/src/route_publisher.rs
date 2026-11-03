@@ -88,7 +88,7 @@ enum FwdCmd {
     Stop,
 }
 
-// Per-route DDS->Zenoh forward queue, the DDS Reader callbacks push and the forwarder task pops.
+// Per-route DDS->Zenoh forward queue, the DDS Reader callbacks push and the forwarder thread pops.
 #[derive(Clone)]
 struct FwdQueue {
     tx: flume::Sender<FwdCmd>,
@@ -168,11 +168,8 @@ pub struct RoutePublisher {
     // the VOLATILE Reader of a topic with both TRANSIENT_LOCAL and VOLATILE local Writers
     #[serde(serialize_with = "serialize_atomic_entity_guid")]
     dds_volatile_reader: Arc<AtomicDDSEntity>,
-    // the MatchingListener activating/deactivating the DDS Reader on remote
-    // subscriber (un)matching. Kept here (NOT backgrounded) so it is undeclared
-    // on Drop — otherwise its callback's clone of the zenoh Publisher forms a
-    // reference cycle, leaking a Reader per route re-creation and duplicating
-    // forwarded messages.
+    // activates the DDS Reader while remote subscribers match. Kept here so Drop undeclares it,
+    // its callback holds the zenoh Publisher and would otherwise keep forwarding.
     #[serde(skip)]
     _matching_listener: Option<MatchingListener<()>>,
     // the Zenoh Priority for publications
@@ -219,16 +216,13 @@ pub struct RoutePublisher {
     // count of payload bytes successfully forwarded DDS->Zenoh by this route
     #[serde(serialize_with = "serialize_arc_atomic_u64")]
     fwd_byte_count: Arc<AtomicU64>,
-    // count of messages dropped because the forward queue was full (i.e. the
-    // zenoh side could not keep up - congested link)
+    // messages evicted from the full forward queue because zenoh could not keep up
     #[serde(serialize_with = "serialize_arc_atomic_u64")]
     dropped_msg_count: Arc<AtomicU64>,
-    // the DDS Reader callbacks enqueue here, a dedicated forwarder task performs the
-    // (possibly blocking) zenoh put. See create() for the rationale.
+    // the DDS Reader callbacks enqueue here, the route's forwarder thread does the possibly blocking put
     #[serde(skip)]
     fwd_queue: FwdQueue,
-    // Set on Drop; the forwarder task checks it on its periodic wakeup, so
-    // termination is guaranteed even when FwdCmd::Stop cannot be enqueued.
+    // set on Drop, ends the forwarder thread even when FwdCmd::Stop cannot be queued
     #[serde(skip)]
     fwd_stop: Arc<AtomicBool>,
     // Serializes DDS Reader activation/deactivation between the matching-
@@ -251,10 +245,7 @@ impl Drop for RoutePublisher {
         // returns so it can't re-create a DDS Reader after we've torn it down.
         self.undeclare_matching_listener();
         self.deactivate_dds_reader();
-        // Stop the forwarder task: flag first (checked on its periodic wakeup,
-        // guaranteed path), then a best-effort sentinel for prompt shutdown.
-        // Both are needed because cyclors leaks the reader-callback closure,
-        // which owns a Sender clone - the channel never disconnects.
+        // the flag ends the forwarder within its 10 s wakeup, Stop ends it at once if the queue has room
         self.fwd_stop.store(true, Ordering::Relaxed);
         let _ = self.fwd_queue.tx.try_send(FwdCmd::Stop);
     }
@@ -404,21 +395,12 @@ impl RoutePublisher {
             volatile_publisher: None,
         }));
 
-        // traffic counters (incremented by the forwarder task on each
-        // successful forward; surfaced in the admin space)
+        // admin space traffic counters, counted per successful forward
         let fwd_msg_count = Arc::new(AtomicU64::new(0));
         let fwd_byte_count = Arc::new(AtomicU64::new(0));
 
-        // Decouple the DDS Reader callback from zenoh backpressure. The DDS
-        // listener callback runs on Cyclone's SINGLE per-domain delivery thread
-        // ("dq.user"), shared by EVERY route of this bridge: a publisher.put()
-        // blocking there on a congested link stalled all DDS->Zenoh forwarding
-        // bridge-wide (and route teardown, via dds_delete waiting for the
-        // callback). The callback now only copies the sample into this bounded
-        // queue; the forwarder task below performs the (possibly blocking) put.
-        // When the queue is full the oldest sample is DROPPED and counted - a bounded,
-        // observable degradation instead of a bridge-wide wedge.
-        //
+        // Reader callbacks run on Cyclone's delivery thread shared by all routes, so they only queue
+        // and the forwarder below does the possibly blocking put.
         // TRANSIENT_LOCAL routes queue as much as they cache, so the history burst at activation fits
         let fwd_queue = FwdQueue::new(queue_limit_for(cache_size));
         let dropped_msg_count = fwd_queue.dropped.clone();
@@ -1059,10 +1041,7 @@ fn activate_dds_reader(
             }
         },
     )?;
-    // Read back the GUID before committing the reader into the atomic; on failure
-    // (e.g. transient BAD_PARAMETER under participant churn) delete the reader and
-    // return Err with the atomic left untouched — avoiding a committed-but-dead
-    // reader that would leak and leave the route "listed but dead".
+    // get_guid can fail under participant churn, then the reader is deleted before it is published
     let reader_gid = match get_guid(&reader) {
         Ok(gid) => gid,
         Err(e) => {

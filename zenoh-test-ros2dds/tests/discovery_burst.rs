@@ -1,19 +1,6 @@
 //
-// Discovery-integrity test: SEDP endpoint BURST.
-//
-// CLAIM UNDER TEST (audit finding; suspected mechanism behind "UI subscribes a
-// point cloud but the bridge never learns about it"):
-//   dds_discovery.rs `on_data` is an edge-triggered DATA_AVAILABLE listener
-//   doing a single bounded `dds_take` of 32 samples per invocation with no
-//   loop-until-empty. A burst of endpoint creations larger than one batch can
-//   leave discovery samples unprocessed, so some subscriptions never produce a
-//   DiscoveredMsgSub event -> no route serves them -> the topic is dead until
-//   another local subscriber appears (the "echo revives it" symptom).
-//
-// The test asserts DESIRED behavior (every live subscription is served by a
-// route that lists its node AND actually delivers data). A RED result under
-// the current code verifies the claim; after a fix this becomes a regression
-// test.
+// A burst of SEDP endpoints larger than one dds_take batch must all be discovered.
+// Every live subscription must be served by a route that lists its node and delivers data.
 
 pub mod common;
 

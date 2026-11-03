@@ -84,8 +84,7 @@ pub struct Context {
     pub(crate) discovered_entities: Arc<RwLock<DiscoveredEntities>>,
     // ros_discovery_info read/write manager
     pub(crate) ros_discovery_mgr: Arc<RosDiscoveryInfoMgr>,
-    // channel for RouteSubscriber publication-matched events:
-    // (ros2 topic name, any matched DDS reader?) - see on_matched_reader_event
+    // RouteSubscriber publication-matched events as (ros2 topic name, any matched DDS reader), see on_matched_reader_event
     pub(crate) matched_reader_tx: flume::Sender<(String, bool)>,
 }
 
@@ -624,8 +623,7 @@ impl RoutesMgr {
         if let Some(route) = self.routes_subscribers.get_mut(&ros2_name) {
             route.update_matched_readers(matched).await;
         }
-        // No route yet: nothing to do - the initial-state callback fires at
-        // route creation, and later matches re-fire the listener.
+        // without a route the listener reports the initial state when the route is created
     }
 
     /// Re-derive every topic subscriber route's DDS Writer from its remaining

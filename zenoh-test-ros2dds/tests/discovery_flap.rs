@@ -1,21 +1,7 @@
 //
-// Discovery-integrity test: RViz-style subscription FLAP
-// (create -> destroy within milliseconds -> recreate).
-//
-// CLAIMS UNDER TEST (audit findings, both filmed in the production log
-// 2026-07-02T04:09:14.775-.871 on /athena/global_costmap/voxel_layer):
-//   1. A DiscoveredMsgSub event can be processed after its reader was already
-//      destroyed -> routes_mgr logs "Failed to get DDS info for any Reader"
-//      and the event is dropped WITHOUT retry.
-//   2. The failure leaves NodeInfo.msg_sub committed, so ONLY a full
-//      destroy(+cleanup)/recreate cycle can ever re-emit the event; if the
-//      remove/add interleaving goes the wrong way the topic is permanently
-//      suppressed for that node ("subscription exists, bridge never routes").
-//
-// The test asserts DESIRED behavior: after the flap settles, every topic that
-// has a LIVE subscription is served by an active route and delivers data.
-// RED under current code verifies the claims; GREEN after a fix = regression
-// test.
+// RViz style subscription flaps (create, destroy within milliseconds, recreate).
+// A DiscoveredMsgSub processed after its reader is gone must be retried, not dropped.
+// After the flaps settle, every topic with a live subscription must have an active route that delivers data.
 
 pub mod common;
 
@@ -52,10 +38,7 @@ async fn flapped_subscriptions_all_get_active_routes() {
     common::init_env();
     std::env::set_var("ROS_DOMAIN_ID", "0");
 
-    // Capture the bridge's own log output: the discovery race manifests as
-    // "Error updating route: Failed to get DDS info for any Reader" (the
-    // production signature from 2026-07-02T04:09:14.775) even when the final
-    // state self-heals via the re-created subscription.
+    // the discovery race logs "Failed to get DDS info for any Reader" even when the recreated subscription heals it
     let logbuf = common::LogBuf::install();
 
     let _bridge = common::create_bridge_with(&BridgeConfig::new(0).listen(BRIDGE_EP)).await;
@@ -94,7 +77,7 @@ async fn flapped_subscriptions_all_get_active_routes() {
                     node.spin_once(Duration::from_millis(1));
                     tokio::time::sleep(Duration::from_millis(1)).await;
                 }
-                // Final keeper subscription — this one stays alive.
+                // Final keeper subscription, this one stays alive.
                 let keeper = node
                     .subscribe::<r2r::std_msgs::msg::String>(&topic, QosProfile::default())
                     .unwrap();

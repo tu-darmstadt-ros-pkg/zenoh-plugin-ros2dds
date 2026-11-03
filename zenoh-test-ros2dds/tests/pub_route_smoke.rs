@@ -1,11 +1,6 @@
 //
-// Functional smoke test for the DDS->Zenoh RoutePublisher data path,
-// using explicit endpoints (NO multicast scouting - runs alongside live ROS
-// systems that hold the default scouting port).
-//
-// Also serves as the regression test for the forwarder-queue rework: the DDS
-// reader callback must enqueue only, the per-route forwarder task performs the
-// zenoh put, and the admin space must expose fwd_msg_count/dropped_msg_count.
+// Smoke test of the DDS to Zenoh RoutePublisher data path over explicit endpoints, without multicast scouting.
+// The admin space must expose fwd_msg_count and dropped_msg_count.
 
 pub mod common;
 

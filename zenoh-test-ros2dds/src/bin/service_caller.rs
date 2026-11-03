@@ -1,14 +1,13 @@
 //! Standalone ROS 2 service-caller process used by the service tests.
 //!
-//! It must be a separate OS process because rcl reads ROS_DOMAIN_ID once per
-//! process — the test hosts the service SERVER on one domain in-process and
-//! spawns this caller on the other domain.
+//! rcl reads ROS_DOMAIN_ID once per process, so the test hosts the server in-process
+//! on one domain and spawns this caller on the other.
 //!
 //! Environment:
-//!   ROS_DOMAIN_ID    - DDS domain (read by rcl)
-//!   SERVICE_NAME     - fully-qualified service to call (AddTwoInts)
-//!   CALL_TIMEOUT_S   - how long to wait for the response (default 30)
-//!   WAIT_AVAILABLE_S - how long to wait for service availability (default 20)
+//!   ROS_DOMAIN_ID      DDS domain, read by rcl
+//!   SERVICE_NAME       fully qualified AddTwoInts service to call
+//!   CALL_TIMEOUT_S     seconds to wait for the response, default 30
+//!   WAIT_AVAILABLE_S   seconds to wait for the service, default 20
 //!
 //! Prints exactly one verdict line on stdout:
 //!   CALLER_SERVICE_UNAVAILABLE | CALLER_GOT_RESPONSE sum=<n> |

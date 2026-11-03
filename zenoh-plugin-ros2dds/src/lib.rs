@@ -484,11 +484,8 @@ impl ROS2PluginRuntime {
             .run(tx, self.config.forward_unclaimed_publishers)
             .await;
 
-        // Subscribe to zenoh transport events to detect when a remote bridge's
-        // session is lost. Unlike the liveliness Delete (which is NOT delivered
-        // on an UNGRACEFUL peer loss), a transport Delete fires reliably on every
-        // session drop, carrying the peer's zid — used to prune stale remote
-        // routes (otherwise services/actions go "listed but dead" after a flap).
+        // The liveliness Delete is missing on an ungraceful peer loss, a transport Delete is not.
+        // Its zid prunes the remote routes of the lost bridge.
         let transport_events_listener = self
             .zsession
             .info()
@@ -578,13 +575,8 @@ impl ROS2PluginRuntime {
                 _ = retry_timer_rcv.recv_async() => {
                     if !pending_prunes.is_empty() {
                         for (zid, zenoh_id) in std::mem::take(&mut pending_prunes) {
-                            // Stale-event guard (evaluated one tick after the
-                            // Delete, when the transport map is settled): if
-                            // the peer already reconnected, pruning would tear
-                            // down freshly rebuilt routes with nothing left to
-                            // rebuild them. NOTE: client-mode peers never appear
-                            // in these iterators - for them the prune always
-                            // proceeds (production bridges run as routers).
+                            // A peer that already reconnected keeps its rebuilt routes.
+                            // Client-mode peers are not listed here, so they are always pruned.
                             let reconnected = self.zsession.info().peers_zid().await.any(|z| z == zid)
                                 || self.zsession.info().routers_zid().await.any(|z| z == zid);
                             if reconnected {
@@ -939,9 +931,7 @@ impl ROS2PluginRuntime {
                 }
             },
             AdminRef::Host => {
-                // OS hostname of the machine running this bridge, plus the ROS
-                // nodename/namespace — a stable, authoritative host identity for
-                // monitoring tools (independent of how the nodename was set).
+                // host identity for monitoring tools, independent of how the nodename was set
                 let hostname = hostname::get()
                     .ok()
                     .and_then(|h| h.into_string().ok())

@@ -107,9 +107,8 @@ impl BridgeConfig {
     }
 }
 
-/// Create and start a bridge from `cfg`. The returned `Runtime` keeps the
-/// bridge alive; pass it to [`close_bridge`] for a clean shutdown (dropping it
-/// without close leaks sockets — that was a measured artifact in earlier runs).
+/// Create and start a bridge from `cfg`. The returned `Runtime` keeps the bridge alive.
+/// Pass it to [`close_bridge`], dropping it without close leaks sockets.
 pub async fn create_bridge_with(cfg: &BridgeConfig) -> Runtime {
     // see base_cyclonedds_uri
     let _start_guard = BRIDGE_START.lock().await;

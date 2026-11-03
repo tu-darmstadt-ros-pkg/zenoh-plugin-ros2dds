@@ -1,31 +1,13 @@
 //
-// Congestion collapse on a constrained link (the production killer).
+// A RELIABLE route on a stalling link, with the default reliable_routes_blocking true and with false.
+// The link alternates 8 s at 250 KB/s with 7 s of full stall, longer than zenoh's
+// wait_before_close (5 s) and shorter than the lease (10 s).
+// Phase A (true) must close the transport, which pins zenoh's congestion policy.
+// Phase B (false) must keep the transport and the best-effort canary alive on the same link.
 //
-// CLAIMS UNDER TEST (audit chain, observed live in production logs):
-//   1. With the default `reliable_routes_blocking: true`, RELIABLE ROS topics
-//      publish as non-droppable (CongestionControl::Block). When the link
-//      cannot drain for longer than zenoh's `wait_before_close` (default 5 s),
-//      zenoh CLOSES THE WHOLE TRANSPORT:
-//      "Unable to push non droppable network message ... Closing transport!"
-//      -> every topic dies at once, reconnect storm, repeat.
-//   2. While a reliable route blocks, best-effort topics sharing the single
-//      default Data priority queue are zero-rated (canary starves), and all
-//      DDS->Zenoh forwarding serializes behind Cyclone's one delivery thread.
-//   3. A/B: `reliable_routes_blocking: false` prevents the transport close and
-//      keeps (some) data flowing on the same constrained link.
+//   ROS publishers (domain 0) -> bridge -> throttled TCP proxy -> zenoh session
 //
-// Topology:  ROS pubs (domain 0, in-process)
-//            -> bridge (connects to throttled TCP proxy)
-//            -> proxy (250 KB/s robot->operator)
-//            -> test zenoh session (listens; subscribes blob/tf/canary)
-//
-// Phase A asserts the REPRODUCTION (defaults must close the transport on a
-// stalled link - pins the claim). Phase B asserts the MITIGATION holds
-// (reliable_routes_blocking=false must survive the same link). Both green =
-// the A/B claim stays verified.
-//
-// Run in RELEASE (zenoh-core `bug!` macros panic in debug builds during
-// transport churn):
+// Run in release, zenoh-core `bug!` panics in debug builds during transport churn.
 //   cargo test --release --test congestion_collapse -- --ignored --nocapture
 
 pub mod common;
@@ -60,8 +42,7 @@ const WARMUP: Duration = Duration::from_secs(10);
 
 /// Forward listen_addr -> target_addr. The robot->operator direction is
 /// throttled AND periodically stalled completely (PASS_SECS at bytes_per_sec,
-/// then STALL_SECS of nothing) — the degraded-WiFi pattern. The reverse
-/// direction is untouched.
+/// then STALL_SECS of nothing), like degraded WiFi. The reverse direction is untouched.
 async fn run_throttle_proxy(listen: &str, target: &str, bytes_per_sec: f64) {
     let listener = tokio::net::TcpListener::bind(listen).await.unwrap();
     loop {
@@ -221,7 +202,7 @@ fn report(name: &str, o: &PhaseOutcome) {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
-#[ignore] // heavy (~3 min) — run explicitly, in RELEASE
+#[ignore] // about 3 min, run explicitly in release
 async fn congestion_collapse_and_mitigation() {
     common::init_env();
     std::env::set_var("ROS_DOMAIN_ID", "0");
@@ -259,7 +240,7 @@ async fn congestion_collapse_and_mitigation() {
     let stop = Arc::new(AtomicBool::new(false));
     spawn_generators(stop.clone());
 
-    // ---------------- Phase A: production defaults ----------------
+    // ---------------- Phase A: defaults ----------------
     tokio::spawn(async {
         run_throttle_proxy("127.0.0.1:7492", "127.0.0.1:7491", THROTTLE_BYTES_PER_SEC).await
     });
@@ -272,9 +253,7 @@ async fn congestion_collapse_and_mitigation() {
         &outcome_a,
     );
 
-    // Tear down phase A. close() can hang if the bridge is wedged in a
-    // blocking put — that hang is itself finding-consistent; fall back to
-    // leaking the runtime.
+    // close() can hang while a put blocks, then the runtime is leaked
     let closed =
         tokio::time::timeout(Duration::from_secs(10), common::close_bridge(bridge_a)).await;
     if closed.is_err() {
@@ -314,11 +293,8 @@ async fn congestion_collapse_and_mitigation() {
         outcome_b.tf_last30
     );
 
-    // Phase A pins the KNOWN default behavior: with reliable_routes_blocking
-    // = true, a stall longer than wait_before_close MUST close the transport
-    // (that is zenoh policy, not a plugin bug - the plugin-side defense is the
-    // config used in phase B). If this stops reproducing, either zenoh changed
-    // its congestion policy or the harness lost its teeth - investigate both.
+    // A stall longer than wait_before_close closes a blocking transport, which is zenoh policy.
+    // If this stops reproducing, zenoh changed its policy or the harness lost its teeth.
     assert!(
         outcome_a.transport_close,
         "phase A no longer reproduces the transport close - zenoh policy or \
