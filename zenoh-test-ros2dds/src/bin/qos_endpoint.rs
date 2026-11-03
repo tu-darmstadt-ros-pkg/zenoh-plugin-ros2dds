@@ -4,8 +4,9 @@
 //!
 //! pub publishes `<tag>:h0..h4` at once and then `<tag>:l<i>` at 10 Hz.
 //! lazy_pub publishes `<tag>:l<i>` at 10 Hz while it has a matched subscription.
-//! sub and tf_sub count std_msgs/String messages or collect tf child frames.
-//! tf_pub publishes one tf2_msgs/TFMessage with child frame `<tag>`.
+//! pub_pair creates one publisher, a second one in the same node on the stdin line `ADD` and deletes it on `DROP`.
+//! sub and tf_sub count std_msgs/String messages or tf child frames.
+//! tf_pub publishes one tf2_msgs/TFMessage with child frame `<tag>`, tf_stream republishes it at 50 Hz.
 //!
 //! Prints `READY` once its entities exist, subscribers then print a cumulative `RESULT ...` line every 200 ms.
 //! Runs until stdin closes, which also happens when the test dies, and then deletes its entities so DDS peers see it leave.
@@ -23,6 +24,8 @@ use r2r::QosProfile;
 const HISTORY_MSGS: usize = 5;
 
 static STOP: AtomicBool = AtomicBool::new(false);
+static ADD_SECOND: AtomicBool = AtomicBool::new(false);
+static DROP_SECOND: AtomicBool = AtomicBool::new(false);
 
 fn stopping() -> bool {
     STOP.load(Ordering::Relaxed)
@@ -106,6 +109,8 @@ fn main() {
     std::thread::spawn(|| {
         for line in std::io::stdin().lock().lines() {
             match line {
+                Ok(l) if l.trim() == "ADD" => ADD_SECOND.store(true, Ordering::Relaxed),
+                Ok(l) if l.trim() == "DROP" => DROP_SECOND.store(true, Ordering::Relaxed),
                 Ok(l) if l.trim() != "QUIT" => continue,
                 _ => break,
             }
@@ -149,7 +154,30 @@ fn main() {
                 i += 1;
             }
         }
-        "tf_pub" => {
+        "pub_pair" => {
+            let _first = node
+                .create_publisher::<r2r::std_msgs::msg::String>(topic, profile.clone())
+                .expect("create publisher");
+            let mut second = None;
+            say("READY");
+            while !stopping() {
+                std::thread::sleep(Duration::from_millis(100));
+                if ADD_SECOND.swap(false, Ordering::Relaxed) {
+                    second = Some(
+                        node.create_publisher::<r2r::std_msgs::msg::String>(topic, profile.clone())
+                            .expect("create publisher"),
+                    );
+                    say("ADDED");
+                }
+                if DROP_SECOND.load(Ordering::Relaxed) {
+                    if let Some(p) = second.take() {
+                        node.destroy_publisher(p);
+                        say("DROPPED");
+                    }
+                }
+            }
+        }
+        "tf_pub" | "tf_stream" => {
             let publisher = node
                 .create_publisher::<r2r::tf2_msgs::msg::TFMessage>(topic, profile)
                 .expect("create publisher");
@@ -157,12 +185,16 @@ fn main() {
             t.header.frame_id = "base_link".to_string();
             t.child_frame_id = tag;
             t.transform.rotation.w = 1.0;
-            publisher
-                .publish(&r2r::tf2_msgs::msg::TFMessage { transforms: vec![t] })
-                .expect("publish");
+            let msg = r2r::tf2_msgs::msg::TFMessage { transforms: vec![t] };
+            publisher.publish(&msg).expect("publish");
             say("READY");
             while !stopping() {
-                std::thread::sleep(Duration::from_millis(100));
+                if role == "tf_stream" {
+                    std::thread::sleep(Duration::from_millis(20));
+                    publisher.publish(&msg).expect("publish");
+                } else {
+                    std::thread::sleep(Duration::from_millis(100));
+                }
             }
         }
         "sub" => {
@@ -176,19 +208,20 @@ fn main() {
             let mut stream = node
                 .subscribe::<r2r::tf2_msgs::msg::TFMessage>(topic, profile)
                 .expect("subscribe");
-            let mut frames = BTreeSet::<String>::new();
+            let mut frames = BTreeMap::<String, usize>::new();
             run_subscriber(
                 &mut node,
                 &mut stream,
                 &mut frames,
                 |f, m| {
                     for t in m.transforms {
-                        f.insert(t.child_frame_id);
+                        *f.entry(t.child_frame_id).or_default() += 1;
                     }
                 },
                 |f| {
-                    let v: Vec<&str> = f.iter().map(|s| s.as_str()).collect();
-                    format!("RESULT frames={}", v.join(","))
+                    let names: Vec<&str> = f.keys().map(|s| s.as_str()).collect();
+                    let counts: Vec<String> = f.iter().map(|(k, n)| format!("{k}:{n}")).collect();
+                    format!("RESULT frames={} counts={}", names.join(","), counts.join(","))
                 },
             );
         }

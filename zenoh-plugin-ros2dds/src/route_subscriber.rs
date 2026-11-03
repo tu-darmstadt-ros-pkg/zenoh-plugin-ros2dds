@@ -47,10 +47,11 @@ use crate::{
     qos::{History, HistoryKind, Qos},
     qos_helpers::{
         is_transient_local, route_qos_summary, same_route_qos, writer_qos_for_remote_writers,
+        writers_qos_for_remote_writers,
     },
     ros2_utils::{is_message_for_action, ros2_message_type_to_dds_type},
     ros_discovery::RosDiscoveryInfoMgr,
-    route_publisher::serialize_arc_atomic_u64,
+    route_publisher::{serialize_arc_atomic_u64, VOLATILE_ATTACHMENT},
     routes_mgr::Context,
     serialize_option_as_bool, vec_into_raw_parts, LOG_PAYLOAD,
 };
@@ -95,6 +96,11 @@ pub struct RouteSubscriber {
     // QoS of the current DDS Writer (None while there is none)
     #[serde(rename = "writer_qos", serialize_with = "serialize_opt_qos")]
     writer_qos: Option<Qos>,
+    // VOLATILE Writer for the marked samples of remote VOLATILE publishers, while remote durabilities mix
+    #[serde(serialize_with = "serialize_atomic_entity_guid")]
+    dds_volatile_writer: Arc<AtomicDDSEntity>,
+    #[serde(serialize_with = "serialize_opt_qos")]
+    volatile_writer_qos: Option<Qos>,
     // action routes have a fixed Writer QoS, topic routes follow the remote publishers
     #[serde(skip)]
     fixed_qos: bool,
@@ -125,10 +131,12 @@ pub struct RouteSubscriber {
 
 impl Drop for RouteSubscriber {
     fn drop(&mut self) {
-        let writer = self.dds_writer.swap(DDS_ENTITY_NULL, Ordering::Relaxed);
-        if writer != DDS_ENTITY_NULL {
-            tracing::debug!("{self}: delete Writer");
-            delete_route_writer(writer, &self.context.ros_discovery_mgr);
+        for writer in [&self.dds_writer, &self.dds_volatile_writer] {
+            let writer = writer.swap(DDS_ENTITY_NULL, Ordering::Relaxed);
+            if writer != DDS_ENTITY_NULL {
+                tracing::debug!("{self}: delete Writer");
+                delete_route_writer(writer, &self.context.ros_discovery_mgr);
+            }
         }
     }
 }
@@ -232,6 +240,8 @@ impl RouteSubscriber {
             announce_qos,
             dds_writer: Arc::new(DDS_ENTITY_NULL.into()),
             writer_qos: None,
+            dds_volatile_writer: Arc::new(DDS_ENTITY_NULL.into()),
+            volatile_writer_qos: None,
             fixed_qos,
             remote_writer_qos: BTreeMap::new(),
             transient_local: false,
@@ -245,8 +255,8 @@ impl RouteSubscriber {
         }
     }
 
-    /// Replaces the route's Writer by a new one with `qos`, the old one is deleted last.
-    fn install_writer(&mut self, qos: Qos) -> Result<(), String> {
+    /// Creates a DDS Writer with `qos` and declares it in ros_discovery_info.
+    fn create_writer(&self, qos: &Qos) -> Result<dds_entity_t, String> {
         tracing::debug!("{self}: create Writer with {qos:?}");
         let writer = create_dds_writer(
             self.context.participant,
@@ -266,6 +276,34 @@ impl RouteSubscriber {
             }
         };
         self.context.ros_discovery_mgr.add_dds_writer(writer_gid);
+        Ok(writer)
+    }
+
+    /// Creates, replaces or deletes the VOLATILE Writer serving marked samples.
+    /// Its readers also match the main Writer, so it needs no matched-reader listener.
+    fn set_volatile_writer(&mut self, qos: Option<Qos>) -> Result<(), String> {
+        let same = match (&self.volatile_writer_qos, &qos) {
+            (Some(a), Some(b)) => same_route_qos(a, b, false),
+            (a, b) => a.is_none() && b.is_none(),
+        };
+        if same {
+            return Ok(());
+        }
+        let writer = match &qos {
+            Some(qos) => self.create_writer(qos)?,
+            None => DDS_ENTITY_NULL,
+        };
+        let old = self.dds_volatile_writer.swap(writer, Ordering::Relaxed);
+        if old != DDS_ENTITY_NULL {
+            delete_route_writer(old, &self.context.ros_discovery_mgr);
+        }
+        self.volatile_writer_qos = qos;
+        Ok(())
+    }
+
+    /// Replaces the route's Writer by a new one with `qos`, the old one is deleted last.
+    fn install_writer(&mut self, qos: Qos) -> Result<(), String> {
+        let writer = self.create_writer(&qos)?;
 
         // DDS-level local-interest detection: activate this route for ANY
         // matched reader, whether or not its node declares it in
@@ -317,6 +355,7 @@ impl RouteSubscriber {
             return Ok(());
         }
         if self.remote_writer_qos.is_empty() {
+            self.set_volatile_writer(None)?;
             if self.transient_local {
                 self.install_writer(self.fallback_writer_qos())?;
                 if self.zenoh_subscriber.is_some() {
@@ -333,11 +372,14 @@ impl RouteSubscriber {
         {
             self.declare_zenoh_subscriber().await?;
         }
-        let remote: Vec<Qos> = self.remote_writer_qos.values().cloned().collect();
-        let desired = writer_qos_for_remote_writers(
-            &remote,
-            self.context.config.transient_local_cache_multiplier,
-        );
+        // remote_publisher_key starts with the announcing bridge's id
+        let remote: Vec<(&str, &Qos)> = self
+            .remote_writer_qos
+            .iter()
+            .map(|(key, qos)| (key.split(':').next().unwrap_or_default(), qos))
+            .collect();
+        let (desired, desired_volatile) = writers_qos_for_remote_writers(&remote);
+        self.set_volatile_writer(desired_volatile)?;
         if let Some(current) = &self.writer_qos {
             if same_route_qos(current, &desired, false) {
                 return Ok(());
@@ -362,16 +404,20 @@ impl RouteSubscriber {
         // Callback routing message received by Zenoh subscriber to the current DDS Writer
         let ros2_name = self.ros2_name.clone();
         let dds_writer = self.dds_writer.clone();
+        let dds_volatile_writer = self.dds_volatile_writer.clone();
         let fwd_msg_count = self.fwd_msg_count.clone();
         let fwd_byte_count = self.fwd_byte_count.clone();
         let subscriber_callback = move |s: Sample| {
-            route_zenoh_message_to_dds(
-                s,
-                &ros2_name,
-                dds_writer.load(Ordering::Relaxed),
-                &fwd_msg_count,
-                &fwd_byte_count,
-            );
+            let volatile = s
+                .attachment()
+                .is_some_and(|a| a.to_bytes().as_ref() == VOLATILE_ATTACHMENT);
+            // a marked sample must stay out of the TRANSIENT_LOCAL history, so it waits for its announcement
+            let writer = if volatile {
+                dds_volatile_writer.load(Ordering::Relaxed)
+            } else {
+                dds_writer.load(Ordering::Relaxed)
+            };
+            route_zenoh_message_to_dds(s, &ros2_name, writer, &fwd_msg_count, &fwd_byte_count);
         };
 
         // a TRANSIENT_LOCAL Writer fetches as much remote history as it keeps
@@ -437,7 +483,7 @@ impl RouteSubscriber {
             history: self.announce_qos.history.clone(),
             ..Default::default()
         };
-        writer_qos_for_remote_writers(&[qos], self.context.config.transient_local_cache_multiplier)
+        writer_qos_for_remote_writers(&[qos])
     }
 
     // Announce the route over Zenoh via a LivelinessToken

@@ -462,6 +462,7 @@ fn activate(
         true,
         qos,
         None,
+        false,
         move |sample| {
             route_dds_request_to_zenoh(&route_id2, sample, &zquerier, dds_writer);
         },

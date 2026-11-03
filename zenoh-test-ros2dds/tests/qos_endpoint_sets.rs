@@ -24,6 +24,13 @@ fn field(route: &serde_json::Value, name: &str) -> String {
     }
 }
 
+/// TRANSIENT_LOCAL history depth of a route's `writer_qos`.
+fn tl_depth(route: &serde_json::Value) -> Option<i32> {
+    field(route, "writer_qos")
+        .split_once("tl_depth=")
+        .and_then(|(_, d)| d.parse().ok())
+}
+
 async fn admin_session(port: u16) -> zenoh::Session {
     let mut cfg = zenoh::Config::default();
     cfg.insert_json5("mode", "\"client\"").unwrap();
@@ -296,11 +303,12 @@ async fn subscriber_writer_rebuilds_follow_remote_publishers() {
         format!("history re-delivered while nothing changed (loop): {dups} -> {}", tl_sub.raw_result()),
     );
 
-    // 6. a publisher with t's QoS joins, the announcement is unchanged
+    // 6. a publisher with t's QoS joins, the shared history is (100 + 100) x multiplier 10
+    check(tl_depth(&r) == Some(100), format!("Writer not sized for t alone: {r}"));
     let pub_t2 = Endpoint::spawn("t2", rd, &["pub", "/rebuild", "rel", "tl", "100", "t2"]).await;
-    tokio::time::sleep(SETTLE).await;
+    tokio::time::sleep(SETTLE + SETTLE).await;
     let r = sub_route(&admin, "rebuild").await;
-    check(field(&r, "dds_writer") == g4, format!("rebuilt for an identical QoS: {r}"));
+    check(tl_depth(&r) == Some(2000), format!("Writer not sized for t and t2: {r}"));
     let late = Endpoint::spawn("late", od, &["sub", "/rebuild", "rel", "tl", "1000"]).await;
     tokio::time::sleep(SETTLE).await;
     // t's own history was evicted by its live messages long ago
@@ -458,4 +466,40 @@ async fn writer_follows_remaining_publishers_after_bridge_loss() {
     assert!(field(&before, "writer_qos").contains("TRANSIENT_LOCAL"), "Writer not TL with a TL publisher: {before}");
     assert!(field(&after, "writer_qos").contains("VOLATILE"), "Writer still TL after its TL publisher's bridge was lost: {after}");
     assert!(a_after > a_mid, "a stopped flowing after the other bridge was lost: {raw}");
+}
+
+/// A node's second TL Writer on a topic counts for the bridged history, joining and leaving.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn second_writer_of_a_node_sizes_the_history() {
+    common::init_env();
+    let (rd, od, port, admin_port) = (50, 51, 7825, 7826);
+    let robot = common::create_bridge_with(&robot_bridge_cfg(rd, port)).await;
+    let operator = common::create_bridge_with(
+        &operator_bridge_cfg(od, port).listen(format!("tcp/127.0.0.1:{admin_port}")),
+    )
+    .await;
+    let admin = admin_session(admin_port).await;
+
+    let sub = Endpoint::spawn("sub", od, &["sub", "/pair", "rel", "tl", "100"]).await;
+    let mut pair = Endpoint::spawn("pair", rd, &["pub_pair", "/pair", "rel", "tl", "3"]).await;
+    tokio::time::sleep(SETTLE + SETTLE).await;
+    let first = sub_route(&admin, "pair").await;
+    // the node is already known, so only the DDS Writer discovery reports the second Writer
+    pair.send("ADD").await;
+    tokio::time::sleep(SETTLE + SETTLE).await;
+    let both = sub_route(&admin, "pair").await;
+    pair.send("DROP").await;
+    tokio::time::sleep(SETTLE + SETTLE).await;
+    let one = sub_route(&admin, "pair").await;
+
+    pair.stop().await;
+    sub.stop().await;
+    let _ = admin.close().await;
+    common::close_bridge(operator).await;
+    common::close_bridge(robot).await;
+
+    // a single Writer keeps its own depth, (3 + 3) x multiplier 10 for two
+    assert_eq!(tl_depth(&first), Some(3), "Writer not sized for one Writer: {first}");
+    assert_eq!(tl_depth(&both), Some(60), "Writer not sized for both Writers: {both}");
+    assert_eq!(tl_depth(&one), Some(3), "Writer not resized after one Writer left: {one}");
 }

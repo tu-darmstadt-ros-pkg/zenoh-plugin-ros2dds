@@ -34,7 +34,7 @@ use crate::{
     discovered_entities::DiscoveredEntities,
     events::{ROS2AnnouncementEvent, ROS2DiscoveryEvent},
     qos_helpers::{
-        adapt_reader_qos_for_writer, adapt_writer_qos_for_reader, announced_qos_for_local_writers,
+        adapt_reader_qos_for_writer, adapt_writer_qos_for_reader, announced_qoses_for_local_writers,
     },
     ros2_utils::{key_expr_to_ros2_name, ros2_name_to_key_expr},
     ros_discovery::RosDiscoveryInfoMgr,
@@ -156,6 +156,10 @@ impl RoutesMgr {
                 match entity {
                     Some(entity) => {
                         let local_writers = self.local_writers_qos(&iface.name);
+                        let (announced, _) = announced_qoses_for_local_writers(
+                            &local_writers,
+                            self.context.config.transient_local_cache_multiplier,
+                        );
                         // Get route (create it if not yet exists)
                         let route = self
                             .get_or_create_route_publisher(
@@ -167,9 +171,7 @@ impl RoutesMgr {
                                 true,
                             )
                             .await?;
-                        route
-                            .add_local_node(node, &announced_qos_for_local_writers(&local_writers))
-                            .await;
+                        route.add_local_node(node, &announced).await;
                         route.update_local_writers(&local_writers).await?;
                     }
                     None => {
@@ -182,7 +184,12 @@ impl RoutesMgr {
             }
 
             UndiscoveredMsgPub(node, iface) => {
-                let local_writers = self.local_writers_qos(&iface.name);
+                // a topic without route needs no O(writers) scan
+                let local_writers = if self.routes_publishers.contains_key(&iface.name) {
+                    self.local_writers_qos(&iface.name)
+                } else {
+                    Vec::new()
+                };
                 if let Entry::Occupied(mut entry) = self.routes_publishers.entry(iface.name.clone())
                 {
                     let route = entry.get_mut();
@@ -196,6 +203,19 @@ impl RoutesMgr {
                         tracing::info!("{route} removed");
                     } else {
                         route.update_local_writers(&local_writers).await?;
+                    }
+                }
+            }
+
+            LocalWritersChanged(name) => {
+                // a topic without route needs no O(writers) scan
+                if self.routes_publishers.contains_key(&name) {
+                    let local_writers = self.local_writers_qos(&name);
+                    // without Writers the node events retire the route, a rebuild would be wasted
+                    if !local_writers.is_empty() {
+                        if let Some(route) = self.routes_publishers.get_mut(&name) {
+                            route.update_local_writers(&local_writers).await?;
+                        }
                     }
                 }
             }

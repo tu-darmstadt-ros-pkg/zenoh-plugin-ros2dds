@@ -12,9 +12,10 @@
 //   ZettaScale Zenoh Team, <zenoh@zettascale.tech>
 //
 use std::{
+    collections::HashMap,
     ffi::{CStr, CString},
     mem::MaybeUninit,
-    sync::{atomic::AtomicI32, Arc},
+    sync::{atomic::AtomicI32, Arc, Mutex},
     time::Duration,
 };
 
@@ -104,8 +105,11 @@ where
         let arg = Box::into_raw(Box::new(callback));
         let listener = dds_create_listener(arg as *mut std::os::raw::c_void);
         dds_lset_publication_matched(listener, Some(publication_matched_trampoline::<F>));
+        // Cyclone copies the listener into the entity
         let ret = dds_set_listener(writer, listener);
+        dds_delete_listener(listener);
         if ret < 0 {
+            drop(Box::from_raw(arg));
             return Err(format!(
                 "Error attaching publication-matched listener: {}",
                 CStr::from_ptr(dds_strretcode(-ret))
@@ -322,11 +326,37 @@ pub fn dds_write(data_writer: dds_entity_t, data: Vec<u8>) -> Result<(), String>
     }
 }
 
+/// Durability of the Writers a Reader received from, Cyclone never reuses instance handles.
+/// One entry per Writer ever seen, only VOLATILE Readers of mixed durability topics keep one.
+#[derive(Default)]
+struct TransientLocalWriters(Mutex<HashMap<dds_instance_handle_t, bool>>);
+
+impl TransientLocalWriters {
+    /// Whether `reader`'s Writer `publication_handle` is TRANSIENT_LOCAL (or stronger).
+    unsafe fn contains(&self, reader: dds_entity_t, publication_handle: dds_instance_handle_t) -> bool {
+        let mut known = self.0.lock().unwrap_or_else(|p| p.into_inner());
+        if let Some(tl) = known.get(&publication_handle) {
+            return *tl;
+        }
+        let writer = dds_get_matched_publication_data(reader, publication_handle);
+        // a Writer gone before its first sample was taken, forwarding beats losing it
+        if writer.is_null() {
+            return false;
+        }
+        let mut kind = dds_durability_kind_DDS_DURABILITY_VOLATILE;
+        let tl = dds_qget_durability((*writer).qos, &mut kind)
+            && kind != dds_durability_kind_DDS_DURABILITY_VOLATILE;
+        dds_builtintopic_free_endpoint(writer);
+        known.insert(publication_handle, tl);
+        tl
+    }
+}
+
 unsafe extern "C" fn listener_to_callback<F>(dr: dds_entity_t, arg: *mut std::os::raw::c_void)
 where
     F: Fn(&DDSRawSample),
 {
-    let callback = arg as *mut F;
+    let (skip, callback) = &*(arg as *const (Option<TransientLocalWriters>, F));
     let mut zp: *mut ddsi_serdata = std::ptr::null_mut();
     #[allow(clippy::uninit_assumed_init)]
     let mut si = MaybeUninit::<[dds_sample_info_t; 1]>::uninit();
@@ -339,10 +369,14 @@ where
     ) > 0
     {
         let si = si.assume_init();
-        if si[0].valid_data {
+        if si[0].valid_data
+            && !skip
+                .as_ref()
+                .is_some_and(|tl| tl.contains(dr, si[0].publication_handle))
+        {
             let raw_sample = DDSRawSample::create(zp);
 
-            (*callback)(&raw_sample);
+            callback(&raw_sample);
         }
         ddsi_serdata_unref(zp);
     }
@@ -357,23 +391,25 @@ pub fn create_dds_reader<F>(
     keyless: bool,
     mut qos: Qos,
     read_period: Option<Duration>,
+    skip_transient_local_writers: bool,
     callback: F,
 ) -> Result<dds_entity_t, String>
 where
     F: Fn(&DDSRawSample) + std::marker::Send + 'static,
 {
+    let skip = skip_transient_local_writers.then(TransientLocalWriters::default);
     unsafe {
         let t = create_topic(dp, &topic_name, &type_name, type_info, keyless);
         match read_period {
             None => {
                 // Use a Listener to route data as soon as it arrives
-                let arg = Box::new(callback);
-                let sub_listener =
-                    dds_create_listener(Box::into_raw(arg) as *mut std::os::raw::c_void);
+                let arg = Box::into_raw(Box::new((skip, callback)));
+                let sub_listener = dds_create_listener(arg as *mut std::os::raw::c_void);
                 dds_lset_data_available(sub_listener, Some(listener_to_callback::<F>));
                 let qos_native = qos.to_qos_native();
                 let reader = dds_create_reader(dp, t, qos_native, sub_listener);
                 Qos::delete_qos_native(qos_native);
+                dds_delete_listener(sub_listener);
                 if reader >= 0 {
                     let res = dds_reader_wait_for_historical_data(reader, qos::DDS_100MS_DURATION);
                     if res < 0 {
@@ -386,6 +422,7 @@ where
                     }
                     Ok(reader)
                 } else {
+                    drop(Box::from_raw(arg));
                     Err(format!(
                         "Error creating DDS Reader: {}",
                         CStr::from_ptr(dds_strretcode(-reader))
@@ -439,7 +476,11 @@ where
                         ) > 0
                         {
                             let si = si.assume_init();
-                            if si[0].valid_data {
+                            if si[0].valid_data
+                                && !skip
+                                    .as_ref()
+                                    .is_some_and(|tl| tl.contains(reader, si[0].publication_handle))
+                            {
                                 let raw_sample = DDSRawSample::create(zp);
                                 callback(&raw_sample);
                             }

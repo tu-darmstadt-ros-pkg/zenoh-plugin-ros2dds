@@ -34,6 +34,8 @@ pub enum ROS2DiscoveryEvent {
     UndiscoveredActionSrv(String, ActionSrv),
     DiscoveredActionCli(String, ActionCli),
     UndiscoveredActionCli(String, ActionCli),
+    /// A DDS Writer appeared on or left a ROS topic, whichever node it belongs to
+    LocalWritersChanged(String),
 }
 
 impl std::fmt::Display for ROS2DiscoveryEvent {
@@ -52,6 +54,7 @@ impl std::fmt::Display for ROS2DiscoveryEvent {
             UndiscoveredServiceCli(node, iface) => write!(f, "Node {node} undeclares {iface}"),
             UndiscoveredActionSrv(node, iface) => write!(f, "Node {node} undeclares {iface}"),
             UndiscoveredActionCli(node, iface) => write!(f, "Node {node} undeclares {iface}"),
+            LocalWritersChanged(name) => write!(f, "Local DDS Writers changed on {name}"),
         }
     }
 }
@@ -79,6 +82,7 @@ impl ROS2DiscoveryEvent {
             DiscoveredActionCli(node, i) | UndiscoveredActionCli(node, i) => {
                 (node, "ActionCli", &i.name)
             }
+            LocalWritersChanged(name) => ("", "LocalWriters", name),
         }
     }
 }

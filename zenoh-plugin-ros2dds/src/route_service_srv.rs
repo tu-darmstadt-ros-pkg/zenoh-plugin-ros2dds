@@ -196,6 +196,7 @@ impl RouteServiceSrv {
             true,
             qos,
             None,
+            false,
             {
                 let queries_in_progress = queries_in_progress.clone();
                 let zenoh_key_expr = zenoh_key_expr.clone();

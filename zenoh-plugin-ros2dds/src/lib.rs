@@ -541,7 +541,12 @@ impl ROS2PluginRuntime {
                     match evt {
                         Ok(evt) => {
                             if self.is_allowed(&evt) {
-                                tracing::info!("{evt} - Allowed");
+                                // one per DDS Writer, too frequent for info
+                                if matches!(evt, ROS2DiscoveryEvent::LocalWritersChanged(_)) {
+                                    tracing::debug!("{evt} - Allowed");
+                                } else {
+                                    tracing::info!("{evt} - Allowed");
+                                }
                                 // This event supersedes any queued retry about
                                 // the same interface: replaying a stale
                                 // Discovered after an Undiscovered (or after an
@@ -833,6 +838,7 @@ impl ROS2PluginRuntime {
                 DiscoveredMsgPub(_, iface) | UndiscoveredMsgPub(_, iface) => {
                     allowance.is_publisher_allowed(&iface.name)
                 }
+                LocalWritersChanged(name) => allowance.is_publisher_allowed(name),
                 DiscoveredMsgSub(_, iface) | UndiscoveredMsgSub(_, iface) => {
                     allowance.is_subscriber_allowed(&iface.name)
                 }

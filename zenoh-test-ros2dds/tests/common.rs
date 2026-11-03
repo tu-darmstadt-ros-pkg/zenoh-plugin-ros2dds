@@ -419,6 +419,30 @@ impl Endpoint {
             .unwrap_or_default()
     }
 
+    /// `tf_sub` role: messages received with child frame `frame`.
+    pub fn frame_count(&self, frame: &str) -> usize {
+        self.result()
+            .get("counts")
+            .and_then(|v| {
+                v.split(',')
+                    .filter_map(|e| e.split_once(':'))
+                    .find(|(f, _)| *f == frame)
+                    .and_then(|(_, n)| n.parse().ok())
+            })
+            .unwrap_or(0)
+    }
+
+    /// Sends one command line to the endpoint.
+    pub async fn send(&mut self, line: &str) {
+        use tokio::io::AsyncWriteExt;
+        let stdin = self.stdin.as_mut().expect("endpoint stdin");
+        stdin
+            .write_all(format!("{line}\n").as_bytes())
+            .await
+            .expect("write endpoint stdin");
+        stdin.flush().await.expect("flush endpoint stdin");
+    }
+
     /// Closes stdin so the endpoint deletes its entities, SIGKILL after 5 s.
     pub async fn stop(mut self) {
         drop(self.stdin.take());
