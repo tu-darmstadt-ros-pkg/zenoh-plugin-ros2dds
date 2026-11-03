@@ -430,16 +430,13 @@ impl RoutePublisher {
             let route_id = format!("Route Publisher (ROS:{ros2_name} -> Zenoh:{zenoh_key_expr})");
             let fwd_stop = fwd_stop.clone();
             let fwd_queue = fwd_queue.clone();
-            tokio::task::spawn(async move {
+            // A blocking put stalls a whole tokio worker, so each route forwards on its own thread.
+            // One OS thread per publisher route, a shared pool would scale better to thousands of routes.
+            let forwarder = move || {
                 loop {
-                    // Bounded wait + stop flag: the FwdCmd::Stop sentinel alone
-                    // is not guaranteed to be deliverable (the queue may be full
-                    // at Drop, and the leaked cyclors callback closure keeps a
-                    // Sender alive so the channel never disconnects). Without
-                    // this, a torn-down route leaked its task + zenoh publisher.
-                    let cmd = tokio::time::timeout(Duration::from_secs(10), fwd_queue.rx.recv_async());
-                    match cmd.await {
-                        Ok(Ok(FwdCmd::Msg { payload, volatile })) => {
+                    // the stop flag ends the thread when Stop cannot be queued, the Reader callbacks keep the channel open
+                    match fwd_queue.rx.recv_timeout(Duration::from_secs(10)) {
+                        Ok(FwdCmd::Msg { payload, volatile }) => {
                             let len = payload.len();
                             fwd_queue.bytes.fetch_sub(len, Ordering::Relaxed);
                             let (publisher, attachment) = {
@@ -451,15 +448,15 @@ impl RoutePublisher {
                                     (None, true) => continue,
                                 }
                             };
-                            if let Err(e) = publisher.put(payload).attachment(attachment).await {
+                            if let Err(e) = publisher.put(payload).attachment(attachment).wait() {
                                 tracing::error!("{route_id}: failed to route message: {e}");
                             } else {
                                 fwd_msg_count.fetch_add(1, Ordering::Relaxed);
                                 fwd_byte_count.fetch_add(len as u64, Ordering::Relaxed);
                             }
                         }
-                        Ok(Ok(FwdCmd::Stop)) | Ok(Err(_)) => break,
-                        Err(_timeout) => {
+                        Ok(FwdCmd::Stop) | Err(flume::RecvTimeoutError::Disconnected) => break,
+                        Err(flume::RecvTimeoutError::Timeout) => {
                             if fwd_stop.load(Ordering::Relaxed) {
                                 break;
                             }
@@ -468,8 +465,12 @@ impl RoutePublisher {
                 }
                 // the Reader callbacks keep the channel alive, so free the samples it still holds
                 while fwd_queue.pop().is_some() {}
-                tracing::debug!("{route_id}: forwarder task terminated");
-            });
+                tracing::debug!("{route_id}: forwarder thread terminated");
+            };
+            std::thread::Builder::new()
+                .name("ros2dds-fwd".into())
+                .spawn(forwarder)
+                .map_err(|e| format!("Route Publisher ({ros2_name}): failed to spawn forwarder thread: {e}"))?;
         }
 
         let mut route = RoutePublisher {
