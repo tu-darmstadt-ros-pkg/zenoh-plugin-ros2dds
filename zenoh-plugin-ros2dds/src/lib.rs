@@ -496,10 +496,7 @@ impl ROS2PluginRuntime {
 
         // Channel for RouteSubscriber publication-matched events (DDS-level
         // local-interest detection, independent of the ROS graph).
-        let (matched_reader_tx, matched_reader_rcv): (
-            Sender<(String, bool)>,
-            Receiver<(String, bool)>,
-        ) = unbounded();
+        let (matched_reader_tx, matched_reader_rcv) = unbounded::<(String, bool)>();
 
         // Create RoutesManager
         let mut routes_mgr = RoutesMgr::new(

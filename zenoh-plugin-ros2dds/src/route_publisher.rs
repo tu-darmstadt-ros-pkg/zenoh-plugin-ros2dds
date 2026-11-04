@@ -1039,7 +1039,7 @@ fn activate_dds_reader(
                 }
                 if fwd_queue.push(sample.into(), volatile) > 0 {
                     let n = fwd_queue.dropped.load(Ordering::Relaxed);
-                    if n == 1 || n % 100 == 0 {
+                    if n == 1 || n.is_multiple_of(100) {
                         tracing::warn!(
                             "{route_id}: forward queue full - {n} message(s) dropped \
                              since activation (zenoh side congested)"

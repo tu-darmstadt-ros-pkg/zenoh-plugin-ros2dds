@@ -783,6 +783,27 @@ impl DiscoveredEntities {
     }
 }
 
+// Remove any null QoS values from a serde_json::Value
+fn remove_null_qos_values(
+    value: Result<serde_json::Value, serde_json::Error>,
+) -> Result<serde_json::Value, serde_json::Error> {
+    match value {
+        Ok(value) => match value {
+            serde_json::Value::Object(mut obj) => {
+                let qos = obj.get_mut("qos");
+                if let Some(qos) = qos {
+                    if qos.is_object() {
+                        qos.as_object_mut().unwrap().retain(|_, v| !v.is_null());
+                    }
+                }
+                Ok(serde_json::Value::Object(obj))
+            }
+            _ => Ok(value),
+        },
+        Err(error) => Err(error),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use std::time::Duration;
@@ -925,7 +946,7 @@ mod tests {
 
         let events = entities.forward_orphan_writers(Duration::ZERO);
         assert_eq!(events.len(), 2);
-        let names: std::collections::HashSet<&str> = events.iter().map(|e| pub_node(e)).collect();
+        let names: std::collections::HashSet<&str> = events.iter().map(pub_node).collect();
         assert_eq!(
             names.len(),
             2,
@@ -1003,26 +1024,5 @@ mod tests {
         // ...and its writers are purged: no ghost re-claim on the next sweep.
         assert!(entities.forward_orphan_writers(Duration::ZERO).is_empty());
         assert!(entities.writers.is_empty(), "writers map must be purged");
-    }
-}
-
-// Remove any null QoS values from a serde_json::Value
-fn remove_null_qos_values(
-    value: Result<serde_json::Value, serde_json::Error>,
-) -> Result<serde_json::Value, serde_json::Error> {
-    match value {
-        Ok(value) => match value {
-            serde_json::Value::Object(mut obj) => {
-                let qos = obj.get_mut("qos");
-                if let Some(qos) = qos {
-                    if qos.is_object() {
-                        qos.as_object_mut().unwrap().retain(|_, v| !v.is_null());
-                    }
-                }
-                Ok(serde_json::Value::Object(obj))
-            }
-            _ => Ok(value),
-        },
-        Err(error) => Err(error),
     }
 }

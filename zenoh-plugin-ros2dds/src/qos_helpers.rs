@@ -308,7 +308,7 @@ pub fn writer_qos_for_remote_writers(remote_writers: &[Qos]) -> Qos {
         max_blocking_time: DDS_100MS_DURATION.saturating_add(1),
     });
     qos.durability = durability(any_tl);
-    qos.durability_service = any_tl.then(|| DurabilityService {
+    qos.durability_service = any_tl.then_some(DurabilityService {
         service_cleanup_delay: 60 * DDS_1S_DURATION,
         history_kind: history.kind,
         history_depth: history.depth,
