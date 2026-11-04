@@ -484,11 +484,8 @@ impl ROS2PluginRuntime {
             .run(tx, self.config.forward_unclaimed_publishers)
             .await;
 
-        // Subscribe to zenoh transport events to detect when a remote bridge's
-        // session is lost. Unlike the liveliness Delete (which is NOT delivered
-        // on an UNGRACEFUL peer loss), a transport Delete fires reliably on every
-        // session drop, carrying the peer's zid — used to prune stale remote
-        // routes (otherwise services/actions go "listed but dead" after a flap).
+        // The liveliness Delete is missing on an ungraceful peer loss, a transport Delete is not.
+        // Its zid prunes the remote routes of the lost bridge.
         let transport_events_listener = self
             .zsession
             .info()
@@ -499,10 +496,7 @@ impl ROS2PluginRuntime {
 
         // Channel for RouteSubscriber publication-matched events (DDS-level
         // local-interest detection, independent of the ROS graph).
-        let (matched_reader_tx, matched_reader_rcv): (
-            Sender<(String, bool)>,
-            Receiver<(String, bool)>,
-        ) = unbounded();
+        let (matched_reader_tx, matched_reader_rcv) = unbounded::<(String, bool)>();
 
         // Create RoutesManager
         let mut routes_mgr = RoutesMgr::new(
@@ -517,6 +511,8 @@ impl ROS2PluginRuntime {
 
         // Retry machinery for failed route updates (see EVENT_RETRY_INTERVAL_MS).
         let mut retry_queue: Vec<(ROS2DiscoveryEvent, u32)> = Vec::new();
+        // topic announcements are one-shot liveliness events, so failed ones are retried too
+        let mut announcement_retry_queue: Vec<(ROS2AnnouncementEvent, u32)> = Vec::new();
         // Transport-loss prunes are DEFERRED one retry tick: the Delete event
         // is broadcast BEFORE the transport is removed from the session's
         // transport map, so an immediate peers_zid()/routers_zid() check could
@@ -539,7 +535,12 @@ impl ROS2PluginRuntime {
                     match evt {
                         Ok(evt) => {
                             if self.is_allowed(&evt) {
-                                tracing::info!("{evt} - Allowed");
+                                // one per DDS Writer, too frequent for info
+                                if matches!(evt, ROS2DiscoveryEvent::LocalWritersChanged(_)) {
+                                    tracing::debug!("{evt} - Allowed");
+                                } else {
+                                    tracing::info!("{evt} - Allowed");
+                                }
                                 // This event supersedes any queued retry about
                                 // the same interface: replaying a stale
                                 // Discovered after an Undiscovered (or after an
@@ -571,13 +572,8 @@ impl ROS2PluginRuntime {
                 _ = retry_timer_rcv.recv_async() => {
                     if !pending_prunes.is_empty() {
                         for (zid, zenoh_id) in std::mem::take(&mut pending_prunes) {
-                            // Stale-event guard (evaluated one tick after the
-                            // Delete, when the transport map is settled): if
-                            // the peer already reconnected, pruning would tear
-                            // down freshly rebuilt routes with nothing left to
-                            // rebuild them. NOTE: client-mode peers never appear
-                            // in these iterators - for them the prune always
-                            // proceeds (production bridges run as routers).
+                            // A peer that already reconnected keeps its rebuilt routes.
+                            // Client-mode peers are not listed here, so they are always pruned.
                             let reconnected = self.zsession.info().peers_zid().await.any(|z| z == zid)
                                 || self.zsession.info().routers_zid().await.any(|z| z == zid);
                             if reconnected {
@@ -585,6 +581,26 @@ impl ROS2PluginRuntime {
                             } else {
                                 tracing::info!("Remote zenoh transport {zenoh_id} gone - pruning its routes");
                                 routes_mgr.on_remote_bridge_left(&zenoh_id);
+                                // a queued retry must not resurrect the departed bridge's routes
+                                let (mp, ms) = (format!("MP:{zenoh_id}:"), format!("MS:{zenoh_id}:"));
+                                announcement_retry_queue.retain(|(q, _)| {
+                                    msg_route_id(q).is_none_or(|id| !id.starts_with(&mp) && !id.starts_with(&ms))
+                                });
+                                // re-derive Writers from the remaining remote publishers
+                                routes_mgr.update_subscriber_writers().await;
+                            }
+                        }
+                    }
+                    if !announcement_retry_queue.is_empty() {
+                        let pending = std::mem::take(&mut announcement_retry_queue);
+                        for (evt, attempts) in pending {
+                            match routes_mgr.on_ros_announcement_event(evt.clone()).await {
+                                Ok(()) => tracing::info!("{evt} - route recovered after {attempts} retry attempt(s)"),
+                                Err(e) if attempts < MAX_EVENT_RETRIES => {
+                                    tracing::debug!("{evt} - retry {attempts} failed: {e}");
+                                    announcement_retry_queue.push((evt, attempts + 1));
+                                }
+                                Err(e) => tracing::warn!("{evt} - giving up after {attempts} failed retries: {e}"),
                             }
                         }
                     }
@@ -624,19 +640,28 @@ impl ROS2PluginRuntime {
                                     // the liveliness token corresponds to a ROS2 announcement
                                     (Some(remaining), _) => {
                                         // parse it and pass ROS2AnnouncementEvent to RoutesMgr
-                                        // A malformed/foreign token with a <3 byte
-                                        // suffix must not panic the plugin task.
-                                        let remaining_str = remaining.as_str();
-                                        if remaining_str.len() < 3 {
-                                            tracing::warn!("Ignoring liveliness token with unexpected short suffix: {ke}");
+                                        // a foreign token must not panic the plugin task
+                                        let Some(prefix) = remaining.as_str().get(..3) else {
+                                            tracing::warn!("Ignoring liveliness token with unexpected suffix: {ke}");
                                             continue;
-                                        }
-                                        match self.parse_announcement_event(ke, &remaining_str[..3], evt.kind()) {
+                                        };
+                                        match self.parse_announcement_event(ke, prefix, evt.kind()) {
                                             Ok(evt) => {
                                                 if self.is_announcement_allowed(&evt) {
                                                     tracing::info!("Remote bridge {zenoh_id} {evt} - Allowed");
-                                                    routes_mgr.on_ros_announcement_event(evt).await
-                                                        .unwrap_or_else(|e| tracing::warn!("Error treating announcement event: {e}"));
+                                                    // a newer event about the same remote route supersedes a queued retry
+                                                    if let Some(id) = msg_route_id(&evt) {
+                                                        announcement_retry_queue.retain(|(q, _)| msg_route_id(q).as_ref() != Some(&id));
+                                                    }
+                                                    let retry_copy = evt.clone();
+                                                    if let Err(e) = routes_mgr.on_ros_announcement_event(evt).await {
+                                                        if msg_route_id(&retry_copy).is_some() {
+                                                            tracing::warn!("Error treating announcement event: {e} - queued for retry");
+                                                            announcement_retry_queue.push((retry_copy, 1));
+                                                        } else {
+                                                            tracing::warn!("Error treating announcement event: {e}");
+                                                        }
+                                                    }
                                                 } else {
                                                     tracing::debug!("Remote bridge {zenoh_id} {evt} - Matching entity denied per config");
                                                 }
@@ -710,10 +735,14 @@ impl ROS2PluginRuntime {
                 ),
             ("MP/", SampleKind::Delete) => parse_ke_liveliness_pub(liveliness_ke)
                 .map_err(|e| format!("Received invalid liveliness token: {e}"))
-                .map(|(zenoh_id, zenoh_key_expr, ..)| RetiredMsgPub {
-                    zenoh_id,
-                    zenoh_key_expr,
-                }),
+                .map(
+                    |(zenoh_id, zenoh_key_expr, _, keyless, writer_qos)| RetiredMsgPub {
+                        zenoh_id,
+                        zenoh_key_expr,
+                        keyless,
+                        writer_qos,
+                    },
+                ),
             ("MS/", SampleKind::Put) => parse_ke_liveliness_sub(liveliness_ke)
                 .map_err(|e| format!("Received invalid liveliness token: {e}"))
                 .map(
@@ -798,6 +827,7 @@ impl ROS2PluginRuntime {
                 DiscoveredMsgPub(_, iface) | UndiscoveredMsgPub(_, iface) => {
                     allowance.is_publisher_allowed(&iface.name)
                 }
+                LocalWritersChanged(name) => allowance.is_publisher_allowed(name),
                 DiscoveredMsgSub(_, iface) | UndiscoveredMsgSub(_, iface) => {
                     allowance.is_subscriber_allowed(&iface.name)
                 }
@@ -900,9 +930,7 @@ impl ROS2PluginRuntime {
                 }
             },
             AdminRef::Host => {
-                // OS hostname of the machine running this bridge, plus the ROS
-                // nodename/namespace — a stable, authoritative host identity for
-                // monitoring tools (independent of how the nodename was set).
+                // host identity for monitoring tools, independent of how the nodename was set
                 let hostname = hostname::get()
                     .ok()
                     .and_then(|h| h.into_string().ok())
@@ -964,4 +992,97 @@ where
     S: Serializer,
 {
     s.serialize_bool(opt.is_some())
+}
+
+/// Retry identity of a topic announcement, None for other kinds.
+/// Publisher ids include the QoS, the Delete of a re-announced route must not supersede the new Put.
+fn msg_route_id(evt: &ROS2AnnouncementEvent) -> Option<String> {
+    use ROS2AnnouncementEvent::*;
+    match evt {
+        AnnouncedMsgPub {
+            zenoh_id,
+            zenoh_key_expr,
+            keyless,
+            writer_qos,
+            ..
+        }
+        | RetiredMsgPub {
+            zenoh_id,
+            zenoh_key_expr,
+            keyless,
+            writer_qos,
+        } => Some(format!(
+            "MP:{zenoh_id}:{zenoh_key_expr}:{}",
+            liveliness_mgt::qos_to_key_expr(*keyless, writer_qos)
+        )),
+        AnnouncedMsgSub {
+            zenoh_id,
+            zenoh_key_expr,
+            ..
+        }
+        | RetiredMsgSub {
+            zenoh_id,
+            zenoh_key_expr,
+        } => Some(format!("MS:{zenoh_id}:{zenoh_key_expr}")),
+        _ => None,
+    }
+}
+
+#[cfg(test)]
+mod msg_route_id_tests {
+    use cyclors::qos::{Durability, DurabilityKind, Qos};
+    use zenoh::key_expr::OwnedKeyExpr;
+
+    use super::*;
+
+    fn ke(s: &str) -> OwnedKeyExpr {
+        OwnedKeyExpr::try_from(s.to_string()).unwrap()
+    }
+    fn qos(tl: bool) -> Qos {
+        Qos {
+            durability: Some(Durability {
+                kind: if tl {
+                    DurabilityKind::TRANSIENT_LOCAL
+                } else {
+                    DurabilityKind::VOLATILE
+                },
+            }),
+            ..Default::default()
+        }
+    }
+    fn put(tl: bool) -> ROS2AnnouncementEvent {
+        ROS2AnnouncementEvent::AnnouncedMsgPub {
+            zenoh_id: ke("z1"),
+            zenoh_key_expr: ke("topic"),
+            ros2_type: "std_msgs/msg/String".into(),
+            keyless: true,
+            writer_qos: qos(tl),
+        }
+    }
+    fn delete(tl: bool) -> ROS2AnnouncementEvent {
+        ROS2AnnouncementEvent::RetiredMsgPub {
+            zenoh_id: ke("z1"),
+            zenoh_key_expr: ke("topic"),
+            keyless: true,
+            writer_qos: qos(tl),
+        }
+    }
+
+    #[test]
+    fn reannouncement_delete_does_not_supersede_new_put() {
+        // make-before-break: Put(new QoS) then Delete(old QoS)
+        assert_ne!(msg_route_id(&put(true)), msg_route_id(&delete(false)));
+        assert_eq!(msg_route_id(&put(true)), msg_route_id(&delete(true)));
+    }
+
+    #[test]
+    fn publisher_and_subscriber_ids_do_not_collide() {
+        let sub = ROS2AnnouncementEvent::RetiredMsgSub {
+            zenoh_id: ke("z1"),
+            zenoh_key_expr: ke("topic"),
+        };
+        assert_ne!(msg_route_id(&sub), msg_route_id(&delete(false)));
+        assert!(msg_route_id(&sub).unwrap().starts_with("MS:z1:"));
+        assert!(msg_route_id(&put(false)).unwrap().starts_with("MP:z1:"));
+    }
 }

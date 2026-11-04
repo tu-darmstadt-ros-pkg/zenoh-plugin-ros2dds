@@ -136,7 +136,7 @@
 
       ////
       //// queries_timeout: Timeouts configuration for various Zenoh queries.
-      ////                  Each field is optional. If not set, the 'default' timeout (5.0 seconds by default) applies to all queries,
+      ////                  Each field is optional. If not set, the 'default' timeout (120.0 seconds by default) applies to all queries,
       ////                  except for actions' get_result that is by default configured with a larget timeout (300.0 seconds)
       ////                  to support actions that last a long time.
       ////                  Refer to https://github.com/eclipse-zenoh/zenoh-plugin-ros2dds/issues/369#issuecomment-2563725619
@@ -147,7 +147,7 @@
       // queries_timeout: {
       //   //// default timeout that will apply to all query, except the ones specified below
       //   //// in 'transient_local_subscribers', 'services' and 'actions'
-      //   default: 5.0,
+      //   default: 120.0,
       //   //// timeouts for TRANSIENT_LOCAL subscriber when querying publishers for historical publications
       //   transient_local_subscribers: 1.0,
       //   //// timeouts for Service clients calling a Service server
@@ -160,13 +160,14 @@
       //   }
       // },
 
-      //// transient_local_cache_multiplier: A multiplier used to determine the size of the `PublicationCache` for a route serving a `TRANSIENT_LOCAL` Publisher.
+      //// transient_local_cache_multiplier: A multiplier used to determine the size of the `PublicationCache` for a route serving `TRANSIENT_LOCAL` Publishers.
       ////                                   When a `TRANSIENT_LOCAL` Publisher is discovered, the plugin creates a route with a `PublicationCache` to store
       ////                                   the publications for late joiner bridges that serve late joiner Subscribers.
-      ////                                   The cache size must be at least equal to the Publisher's `history_length` QoS setting.
-      ////                                   Since the plugin creates one route per topic, the route might serve multiple Publishers.
-      ////                                   Therefore, the `PublicationCache` size is calculated as `history_length * transient_local_cache_multiplier`.
-      ////                                   If there are more than 10 `TRANSIENT_LOCAL` Publishers on the same topic, consider increasing this multiplier.
+      ////                                   The remote bridge's DDS Writer keeps the same history for late joiner Subscribers.
+      ////                                   With a single `TRANSIENT_LOCAL` Publisher on a topic, the size is that Publisher's `history_length`.
+      ////                                   With several, they share one history of the sum of their `history_length` times `transient_local_cache_multiplier`,
+      ////                                   so that a fast Publisher does not evict the history of a slow one.
+      ////                                   Action feedback and status routes use `history_length * transient_local_cache_multiplier`.
       // transient_local_cache_multiplier: 10,
 
       ////

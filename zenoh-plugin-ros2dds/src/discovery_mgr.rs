@@ -31,6 +31,14 @@ use crate::{
     ros_discovery::*, ChannelEvent, ROS_DISCOVERY_INFO_POLL_INTERVAL_MS,
 };
 
+/// Event for a DDS Writer change on the message topic `dds_topic`, action topics have fixed QoS routes.
+fn local_writers_changed(dds_topic: &str) -> Option<ROS2DiscoveryEvent> {
+    dds_topic
+        .strip_prefix("rt")
+        .filter(|name| name.starts_with('/') && !name.contains("/_action/"))
+        .map(|name| ROS2DiscoveryEvent::LocalWritersChanged(name.to_string()))
+}
+
 pub struct DiscoveryMgr {
     pub participant: dds_entity_t,
     pub ros_discovery_mgr: Arc<RosDiscoveryInfoMgr>,
@@ -90,16 +98,22 @@ impl DiscoveryMgr {
                                 }
                             },
                             DDSDiscoveryEvent::DiscoveredPublication{entity} => {
+                                let topic = entity.topic_name.clone();
                                 let e = zwrite!(discovered_entities).add_writer(entity);
-                                if let Some(e) = e {
+                                for e in e.into_iter().chain(local_writers_changed(&topic)) {
                                     if let Err(err) = evt_sender.try_send(e) {
                                         tracing::error!("Internal error: failed to send DDSDiscoveryEvent to main loop: {err}");
                                     }
                                 }
                             },
                             DDSDiscoveryEvent::UndiscoveredPublication{key} => {
-                                let e = zwrite!(discovered_entities).remove_writer(&key);
-                                if let Some(e) = e {
+                                let (topic, e) = {
+                                    let mut entities = zwrite!(discovered_entities);
+                                    let topic = entities.get_writer(&key).map(|w| w.topic_name.clone());
+                                    (topic, entities.remove_writer(&key))
+                                };
+                                let changed = topic.and_then(|t| local_writers_changed(&t));
+                                for e in e.into_iter().chain(changed) {
                                     if let Err(err) = evt_sender.try_send(e) {
                                         tracing::error!("Internal error: failed to send DDSDiscoveryEvent to main loop: {err}");
                                     }

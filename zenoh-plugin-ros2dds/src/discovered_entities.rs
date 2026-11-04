@@ -39,17 +39,13 @@ use crate::{
 /// routed (e.g. ros2_control's `controller_manager/activity` publisher, which
 /// appears in DDS discovery as `_NODE_NAME_UNKNOWN_`).
 ///
-/// One synthetic node PER PARTICIPANT (suffix = participant gid): a shared
-/// fullname would collapse all participants' claims into one `local_nodes`
-/// entry at the routes level, so the first departing participant tore down a
-/// route other participants still needed (seen in production on /tf).
+/// One synthetic node per participant (suffix is the participant gid). A shared
+/// fullname would merge all participants into one `local_nodes` entry, and the
+/// first participant to leave would tear down a route the others still need.
 pub(crate) const ORPHAN_NODE_PREFIX: &str = "_zenoh_orphan_endpoints_";
 
-/// A writer is only orphan-claimed after staying undeclared for this long.
-/// Without a grace period the 100ms sweep claimed every writer whose owning
-/// node's `ros_discovery_info` was merely still in flight (i.e. virtually all
-/// of them at startup - seen in production on the joy topic, claimed one poll
-/// tick before its node's declaration arrived).
+/// A writer is only orphan-claimed after staying undeclared for this long, so the 100ms sweep
+/// does not claim writers whose node's `ros_discovery_info` is still in flight at startup.
 pub(crate) const ORPHAN_GRACE_PERIOD: std::time::Duration = std::time::Duration::from_secs(5);
 
 /// Node-internal standard topics: every node has these writers, they are
@@ -235,6 +231,18 @@ impl DiscoveredEntities {
     #[inline]
     pub fn get_writer(&self, gid: &Gid) -> Option<&DdsEntity> {
         self.writers.get(gid)
+    }
+
+    /// QoS of every discovered (i.e. non-bridge) DDS Writer on `topic_name`,
+    /// in GID order so that QoS derived from them is deterministic.
+    pub fn writers_qos_on_topic(&self, topic_name: &str) -> Vec<cyclors::qos::Qos> {
+        let mut writers: Vec<&DdsEntity> = self
+            .writers
+            .values()
+            .filter(|w| w.topic_name == topic_name)
+            .collect();
+        writers.sort_by_cached_key(|w| w.key.to_string());
+        writers.into_iter().map(|w| w.qos.clone()).collect()
     }
 
     #[inline]
@@ -521,14 +529,10 @@ impl DiscoveredEntities {
         events
     }
 
-    /// Resolve endpoints that a node declared in `ros_discovery_info` BEFORE
-    /// their DDS (SEDP) discovery reached us. Normally `add_reader`/`add_writer`
-    /// resolve them on arrival — but if that arrival is ever missed (burst
-    /// loss, event/channel hiccup) the endpoint stayed parked in the
-    /// `undiscovered_*` lists FOREVER and its topic was never routed
-    /// ("subscription exists, bridge never routes" - the production RViz/cloud
-    /// symptom class). Called periodically from the discovery poll as a
-    /// self-healing reconciliation.
+    /// Resolve endpoints that a node declared in `ros_discovery_info` before their DDS (SEDP)
+    /// discovery reached us. `add_reader`/`add_writer` normally resolve them on arrival.
+    /// If that arrival is missed, the endpoint stays in the `undiscovered_*` lists and its topic
+    /// is never routed, so the discovery poll calls this periodically.
     pub fn resolve_pending_endpoints(&mut self) -> Vec<ROS2DiscoveryEvent> {
         let Self {
             writers,
@@ -600,8 +604,7 @@ impl DiscoveredEntities {
         let mut events: Vec<ROS2DiscoveryEvent> = Vec::new();
         let now = std::time::Instant::now();
 
-        // Set of already-claimed Writer GIDs, built ONCE per sweep (O(1) per
-        // candidate instead of O(nodes) - the sweep runs on every 100ms poll).
+        // built once per sweep, the sweep runs on every 100ms poll
         let claimed_writers: std::collections::HashSet<Gid> = self
             .nodes_info
             .values()
@@ -615,9 +618,7 @@ impl DiscoveredEntities {
             })
             .collect();
 
-        // Candidate orphans: plain message Writers ("rt/<topic>") not yet claimed.
-        // Action sub-topics ("rt/<action>/_action/...") are excluded - tracked
-        // separately, not via msg_pub. Standard node-internal topics excluded.
+        // unclaimed message Writers ("rt/<topic>"), action sub-topics and node-internal topics are tracked elsewhere
         let orphan_candidates: Vec<DdsEntity> = self
             .writers
             .values()
@@ -782,6 +783,27 @@ impl DiscoveredEntities {
     }
 }
 
+// Remove any null QoS values from a serde_json::Value
+fn remove_null_qos_values(
+    value: Result<serde_json::Value, serde_json::Error>,
+) -> Result<serde_json::Value, serde_json::Error> {
+    match value {
+        Ok(value) => match value {
+            serde_json::Value::Object(mut obj) => {
+                let qos = obj.get_mut("qos");
+                if let Some(qos) = qos {
+                    if qos.is_object() {
+                        qos.as_object_mut().unwrap().retain(|_, v| !v.is_null());
+                    }
+                }
+                Ok(serde_json::Value::Object(obj))
+            }
+            _ => Ok(value),
+        },
+        Err(error) => Err(error),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use std::time::Duration;
@@ -868,11 +890,9 @@ mod tests {
         assert!(entities.forward_orphan_writers(Duration::ZERO).is_empty());
     }
 
-    /// FIXED (was: sticky misattribution): a writer claimed by the orphan sweep
-    /// is TRANSFERRED to its real node when that node's (late)
-    /// ros_discovery_info finally declares it — with the real node's Discovered
-    /// event emitted BEFORE the orphan's Undiscovered event, so the route never
-    /// flaps through an empty local_nodes set.
+    /// An orphan-claimed writer moves to its real node once that node declares it.
+    /// The real node's Discovered event comes before the orphan's Undiscovered event,
+    /// so the route never passes through an empty local_nodes set.
     #[test]
     fn orphaned_writer_is_transferred_to_late_declaring_node() {
         let mut entities = DiscoveredEntities::default();
@@ -911,9 +931,8 @@ mod tests {
         assert!(entities.forward_orphan_writers(Duration::ZERO).is_empty());
     }
 
-    /// FIXED (was: shared fullname collision tearing down live routes): each
-    /// participant gets its own synthetic node, so one participant's departure
-    /// only removes ITS local_nodes entry — the route keeps serving the other.
+    /// Each participant gets its own synthetic node, so one participant leaving
+    /// only removes its own local_nodes entry and the route keeps serving the other.
     #[test]
     fn orphan_nodes_are_participant_unique_and_independent() {
         let p1 = Gid::from([1; 16]);
@@ -927,7 +946,7 @@ mod tests {
 
         let events = entities.forward_orphan_writers(Duration::ZERO);
         assert_eq!(events.len(), 2);
-        let names: std::collections::HashSet<&str> = events.iter().map(|e| pub_node(e)).collect();
+        let names: std::collections::HashSet<&str> = events.iter().map(pub_node).collect();
         assert_eq!(
             names.len(),
             2,
@@ -948,8 +967,7 @@ mod tests {
         assert!(p2_owns, "participant 2's orphan claim must survive");
     }
 
-    /// FIXED (was: claimed at startup): node-internal standard topics are never
-    /// orphan-forwarded.
+    /// Node-internal standard topics are never orphan-forwarded.
     #[test]
     fn rosout_and_parameter_events_are_never_orphan_forwarded() {
         let mut entities = DiscoveredEntities::default();
@@ -959,9 +977,8 @@ mod tests {
         assert!(entities.forward_orphan_writers(Duration::ZERO).is_empty());
     }
 
-    /// FIXED (was: no grace period): a writer whose ros_discovery_info is
-    /// merely late is NOT claimed while the grace period runs — the real node
-    /// wins the race and claims it normally.
+    /// A writer whose ros_discovery_info is late is not claimed during the grace period,
+    /// so the real node claims it normally.
     #[test]
     fn grace_period_lets_late_rdi_win() {
         let mut entities = DiscoveredEntities::default();
@@ -1007,26 +1024,5 @@ mod tests {
         // ...and its writers are purged: no ghost re-claim on the next sweep.
         assert!(entities.forward_orphan_writers(Duration::ZERO).is_empty());
         assert!(entities.writers.is_empty(), "writers map must be purged");
-    }
-}
-
-// Remove any null QoS values from a serde_json::Value
-fn remove_null_qos_values(
-    value: Result<serde_json::Value, serde_json::Error>,
-) -> Result<serde_json::Value, serde_json::Error> {
-    match value {
-        Ok(value) => match value {
-            serde_json::Value::Object(mut obj) => {
-                let qos = obj.get_mut("qos");
-                if let Some(qos) = qos {
-                    if qos.is_object() {
-                        qos.as_object_mut().unwrap().retain(|_, v| !v.is_null());
-                    }
-                }
-                Ok(serde_json::Value::Object(obj))
-            }
-            _ => Ok(value),
-        },
-        Err(error) => Err(error),
     }
 }

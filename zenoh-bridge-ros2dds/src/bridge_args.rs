@@ -64,7 +64,7 @@ pub struct BridgeArgs {
     /// A float in seconds that will be used as a timeout when the bridge queries any other remote bridge
     /// for discovery information and for historical data for TRANSIENT_LOCAL DDS Readers it serves
     /// (i.e. if the query to the remote bridge exceed the timeout, some historical samples might be not routed to the Readers, but the route will not be blocked forever).
-    /// This value overwrites the value possibly set in configuration file under 'plugins/ros2dds/queries_timeout/default' key [default: 5.0].
+    /// This value overwrites the value possibly set in configuration file under 'plugins/ros2dds/queries_timeout/default' key [default: 120.0].
     #[arg(long, value_name = "FLOAT", verbatim_doc_comment)]
     pub queries_timeout_default: Option<f32>,
 

@@ -1,24 +1,8 @@
 //
-// Service round-trip vs. the bridge's default queries_timeout (5 s).
+// A service slower than the old 5 s queries_timeout must still answer its client.
+// The server replies after 8 s, fast_add checks that the pipeline works at all.
 //
-// CLAIM UNDER TEST (audit finding B3; matches the production symptom "the
-// request visibly executes but the response never arrives"):
-//   The client-side bridge's RouteServiceCli Querier uses queries_timeout
-//   (default 5.0 s, config.rs DEFAULT_QUERIES_TIMEOUT). Any service slower
-//   than that executes on the server side, but the zenoh query is finalized
-//   before the reply returns, so the ROS client never receives a response.
-//   (Actions' get_result was special-cased to 300 s upstream for exactly this
-//   reason; plain services were not.)
-//
-// Topology: caller (domain 11, separate process) -> bridge O (domain 11)
-//           -> tcp -> bridge R (domain 10) -> server (domain 10, in-process).
-//
-// Two probes:
-//   fast_add  (replies immediately) — sanity: MUST work, else the pipeline is
-//              broken and the slow verdict would be meaningless.
-//   slow_add  (replies after 8 s)   — DESIRED behavior: response arrives
-//              (caller prints CALLER_GOT_RESPONSE). RED verifies the claim:
-//              server's request counter is 1 but caller prints CALLER_TIMEOUT.
+//   caller (domain 11, separate process) -> bridge O -> tcp -> bridge R -> server (domain 10)
 
 pub mod common;
 

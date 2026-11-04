@@ -1,20 +1,10 @@
 //
-// THE production UI scenario, distilled: a DDS reader that exists at the DDS
-// level but is NEVER declared in ros_discovery_info (hector-UI subscriptions
-// and ros2_control endpoints show as _NODE_NAME_UNKNOWN_ in
-// `ros2 topic info -v`). Verified live on 2026-07-02: the UI's PointCloud2
-// reader (GID ...5e04) was known to the bridge's DDS discovery but absent
-// from the ROS graph, so no route ever served it - clouds only flowed while a
-// terminal echo (a properly-declared reader) kept the route active.
+// A DDS reader that no node declares in ros_discovery_info must still be served.
+// Such readers show as _NODE_NAME_UNKNOWN_ in `ros2 topic info -v`.
 //
-// With publication-matched activation, the route's DDS writer detecting ANY
-// matched reader is authoritative local interest. This test builds:
+//   r2r publisher (domain 10) -> bridge R -> tcp -> bridge O (domain 0) -> raw cyclors reader on domain 0
 //
-//   r2r publisher (domain 10) -> bridge R -> tcp -> bridge O (domain 0)
-//   -> raw cyclors reader on domain 0 (blob topic, NO ros_discovery_info)
-//
-// and asserts the raw reader receives data and the route reports the
-// synthetic "<matched_dds_readers>" local node.
+// The route must report the synthetic "<matched_dds_readers>" local node.
 
 pub mod common;
 
@@ -64,8 +54,7 @@ async fn unattributed_dds_reader_gets_served() {
     // operator-side RouteSubscriber (whose DDS writer we will match).
     tokio::time::sleep(Duration::from_secs(5)).await;
 
-    // "Operator"-side RAW cyclors reader on domain 0: a DDS endpoint with NO
-    // ROS node and NO ros_discovery_info - invisible to the ROS graph.
+    // raw cyclors reader on the operator side, without ROS node or ros_discovery_info
     let received = Arc::new(AtomicU64::new(0));
     let received2 = received.clone();
     let stop_reader = stop.clone();

@@ -17,7 +17,7 @@ edition = "2021"
 
 [dependencies]
 cdr = "0.2.4"
-cyclors = "0.2.7"
+cyclors = "0.4.0"
 futures = "0.3.26"
 r2r = "0.9.5"
 serde = "1.0.219"
@@ -33,12 +33,17 @@ tokio = { version = "1.47.1", default-features = false, features = [
   "sync",
 ] } # Default features are disabled due to some crates' requirements
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
-zenoh = { git = "https://github.com/eclipse-zenoh/zenoh.git", branch = "main", features = [
+zenoh = { version = "=1.10.2", features = [
   "plugins",
   "unstable",
 ] }
-zenoh-config = { git = "https://github.com/eclipse-zenoh/zenoh.git", branch = "main", default-features = false }
+zenoh-config = { version = "=1.10.2", default-features = false }
 zenoh-plugin-ros2dds = { path = "../zenoh-plugin-ros2dds/", default-features = false }
 
 # We need an empty workspace to avoid being viewed as a part of zenoh-plugin-ros2dds
 [workspace]
+
+# zenoh 1.10.2 asserts "Undefined face context" when in-process runtimes close, release builds only log it.
+# This also disables zenoh's other debug asserts, remove it with the next zenoh version.
+[profile.dev.package.zenoh]
+debug-assertions = false

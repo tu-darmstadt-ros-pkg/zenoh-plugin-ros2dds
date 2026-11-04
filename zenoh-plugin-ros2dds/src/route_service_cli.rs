@@ -75,23 +75,16 @@ pub struct RouteServiceCli {
     // the local DDS Writer sending replies to the client
     #[serde(serialize_with = "serialize_atomic_entity_guid")]
     rep_writer: Arc<AtomicDDSEntity>,
-    // the MatchingListener activating/deactivating the DDS Reader/Writer on remote
-    // queryable (un)matching. Kept here (NOT backgrounded) so it is undeclared
-    // on Drop — otherwise its callback's clones of the zenoh Querier + DDS entity
-    // handles leak and can flip a live route's request/reply entities.
-    // (Same bug as RoutePublisher.)
+    // activates the DDS Reader and Writer while remote queryables match. Kept here so Drop
+    // undeclares it, its callback holds the zenoh Querier and the DDS entity handles.
     #[serde(skip)]
     _matching_listener: Option<MatchingListener<()>>,
     // TypeInfo for DDS entity creation (if available); retained so the route can
     // re-activate its DDS entities when a remote server reconnects (see add_remote_route)
     #[serde(skip)]
     _type_info: Option<Arc<TypeInfo>>,
-    // Serializes activate()/deactivate() across their three unsynchronized
-    // callers (matching-listener callback on a zenoh thread, add_remote_route
-    // re-activation on the routes-mgr task, deactivate on retire/prune/Drop).
-    // Without it, two concurrent activations can commit a MISMATCHED pair:
-    // a live request reader whose callback captured an already-deleted reply
-    // writer - requests then execute but replies go to a dead entity.
+    // Serializes activate() and deactivate() between the matching listener, add_remote_route and Drop.
+    // Two concurrent activations could pair a request reader with an already deleted reply writer.
     #[serde(skip)]
     activation_lock: Arc<Mutex<()>>,
     // a liveliness token associated to this route, for announcement to other plugins
@@ -278,12 +271,7 @@ impl RouteServiceCli {
             .insert(format!("{zenoh_id}:{zenoh_key_expr}"));
         tracing::debug!("{self}: now serving remote routes {:?}", self.remote_routes);
 
-        // A remote server reconnecting (e.g. after a link flap that pruned the
-        // old session and deactivated us) arrives here. The matching listener
-        // only (re)activates on a `matching:false -> true` transition, which may
-        // not fire on reconnect — so if we now match a queryable but the DDS
-        // entities are inactive, (re)activate them. Otherwise the route stays
-        // discoverable but with a dead request/reply path ("listed but dead").
+        // The matching listener may not fire when a pruned remote server reconnects, so activate here.
         if self.req_reader.load(Ordering::Relaxed) == DDS_ENTITY_NULL {
             match self._zenoh_querier.matching_status().wait() {
                 Ok(status) if status.matching() => {
@@ -415,13 +403,7 @@ fn activate(
         qos.user_data.as_ref().unwrap()
     );
 
-    // Activation is transactional: build BOTH entities and fetch their GUIDs into
-    // locals first; only publish them into the atomics once everything succeeds.
-    // If any step fails (e.g. get_guid returns BAD_PARAMETER under participant
-    // churn), delete whatever was created and return Err with the atomics left
-    // untouched (still NULL). This prevents a half-activated route — a writer
-    // live but reader absent, or both live while the route reports inactive —
-    // which would otherwise leak entities and leave a "listed but dead" route.
+    // Activation is all or nothing, the atomics stay NULL if any step fails.
 
     // create DDS Writer to send replies coming from Zenoh to the Client
     let rep_topic_name = format!("rr{}Reply", ros2_name);
@@ -430,13 +412,7 @@ fn activate(
     let req_topic_name = format!("rq{}Request", ros2_name);
     let req_type_name = ros2_service_type_to_request_dds_type(ros2_type);
 
-    // Build both entities and read back their GUIDs into locals first; only
-    // publish them into the atomics once everything succeeds. On any failure
-    // (e.g. transient BAD_PARAMETER under participant churn), delete whatever was
-    // created and return Err with the atomics left untouched — preventing a
-    // half-activated route (writer live but reader absent, or both live while the
-    // route reports inactive) that would leak entities and leave a "listed but
-    // dead" route. The route then re-activates via the normal recovery paths.
+    // get_guid can fail under participant churn, so entities are published only once all succeeded
     let dds_writer = create_dds_writer(
         context.participant,
         rep_topic_name,
@@ -462,6 +438,7 @@ fn activate(
         true,
         qos,
         None,
+        false,
         move |sample| {
             route_dds_request_to_zenoh(&route_id2, sample, &zquerier, dds_writer);
         },
@@ -481,8 +458,7 @@ fn activate(
         }
     };
 
-    // Everything succeeded — commit. Register GIDs and publish into the atomics,
-    // deleting any pre-existing entities we overwrite.
+    // commit, deleting any entities that are replaced
     context.ros_discovery_mgr.add_dds_writer(writer_gid);
     let old = rep_writer.swap(dds_writer, Ordering::Relaxed);
     if old != DDS_ENTITY_NULL {

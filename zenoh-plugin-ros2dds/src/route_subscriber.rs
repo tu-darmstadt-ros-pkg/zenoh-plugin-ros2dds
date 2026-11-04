@@ -13,7 +13,7 @@
 //
 
 use std::{
-    collections::HashSet,
+    collections::{BTreeMap, HashSet},
     ffi::CStr,
     fmt,
     sync::{
@@ -40,13 +40,18 @@ use zenoh_ext::{AdvancedSubscriber, AdvancedSubscriberBuilderExt, HistoryConfig}
 use crate::{
     dds_utils::{
         attach_publication_matched_listener, create_dds_writer, ddsrt_iov_len_from_usize,
-        delete_dds_entity, get_guid, serialize_entity_guid,
+        delete_dds_entity, detach_listener, get_guid, publication_matched_count,
+        serialize_atomic_entity_guid, AtomicDDSEntity, DDS_ENTITY_NULL,
     },
-    liveliness_mgt::new_ke_liveliness_sub,
-    qos::{History, Qos},
-    qos_helpers::is_transient_local,
+    liveliness_mgt::{new_ke_liveliness_sub, qos_to_key_expr},
+    qos::{History, HistoryKind, Qos},
+    qos_helpers::{
+        is_transient_local, route_qos_summary, same_route_qos, writer_qos_for_remote_writers,
+        writers_qos_for_remote_writers,
+    },
     ros2_utils::{is_message_for_action, ros2_message_type_to_dds_type},
-    route_publisher::serialize_arc_atomic_u64,
+    ros_discovery::RosDiscoveryInfoMgr,
+    route_publisher::{serialize_arc_atomic_u64, VOLATILE_ATTACHMENT},
     routes_mgr::Context,
     serialize_option_as_bool, vec_into_raw_parts, LOG_PAYLOAD,
 };
@@ -60,6 +65,10 @@ enum ZSubscriber {
 /// matched with this route's writer", used when the reader's node never
 /// declares it in ros_discovery_info (see attach_publication_matched_listener).
 const MATCHED_READERS_KEY: &str = "<matched_dds_readers>";
+
+/// Time for readers to match a rebuilt Writer before a zero match count retires MATCHED_READERS_KEY.
+/// A fixed delay, a reader matching later than this re-activates the route through the listener.
+const MATCH_RECHECK_DELAY: Duration = Duration::from_secs(3);
 
 // a route from Zenoh to DDS
 #[allow(clippy::upper_case_acronyms)]
@@ -81,9 +90,23 @@ pub struct RouteSubscriber {
     // QoS used when announcing the route on matched-reader activation
     #[serde(skip)]
     announce_qos: Qos,
-    // the local DDS Writer created to serve the route (i.e. re-publish to DDS message coming from zenoh)
-    #[serde(serialize_with = "serialize_entity_guid")]
-    dds_writer: dds_entity_t,
+    // the local DDS Writer re-publishing what comes from zenoh, NULL until needed, swapped on rebuild
+    #[serde(serialize_with = "serialize_atomic_entity_guid")]
+    dds_writer: Arc<AtomicDDSEntity>,
+    // QoS of the current DDS Writer (None while there is none)
+    #[serde(rename = "writer_qos", serialize_with = "serialize_opt_qos")]
+    writer_qos: Option<Qos>,
+    // VOLATILE Writer for the marked samples of remote VOLATILE publishers, while remote durabilities mix
+    #[serde(serialize_with = "serialize_atomic_entity_guid")]
+    dds_volatile_writer: Arc<AtomicDDSEntity>,
+    #[serde(serialize_with = "serialize_opt_qos")]
+    volatile_writer_qos: Option<Qos>,
+    // action routes have a fixed Writer QoS, topic routes follow the remote publishers
+    #[serde(skip)]
+    fixed_qos: bool,
+    // QoS announced by each remote publisher route, see remote_publisher_key
+    #[serde(skip)]
+    remote_writer_qos: BTreeMap<String, Qos>,
     // if the Writer is TRANSIENT_LOCAL
     transient_local: bool,
     // queries timeout for historical publication (if TRANSIENT_LOCAL)
@@ -108,16 +131,27 @@ pub struct RouteSubscriber {
 
 impl Drop for RouteSubscriber {
     fn drop(&mut self) {
-        // remove writer's GID from ros_discovery_info message
-        match get_guid(&self.dds_writer) {
-            Ok(gid) => self.context.ros_discovery_mgr.remove_dds_writer(gid),
-            Err(e) => tracing::warn!("{self}: {e}"),
+        for writer in [&self.dds_writer, &self.dds_volatile_writer] {
+            let writer = writer.swap(DDS_ENTITY_NULL, Ordering::Relaxed);
+            if writer != DDS_ENTITY_NULL {
+                tracing::debug!("{self}: delete Writer");
+                delete_route_writer(writer, &self.context.ros_discovery_mgr);
+            }
         }
+    }
+}
 
-        tracing::debug!("{self}: delete Writer");
-        if let Err(e) = delete_dds_entity(self.dds_writer) {
-            tracing::warn!("{}: error deleting DDS Reader:  {}", self, e);
-        }
+/// Deletes a route Writer, detaching its listener first so that no spurious unmatch is reported.
+fn delete_route_writer(writer: dds_entity_t, ros_discovery_mgr: &RosDiscoveryInfoMgr) {
+    if let Err(e) = detach_listener(writer) {
+        tracing::debug!("detach listener from DDS Writer {writer}: {e}");
+    }
+    match get_guid(&writer) {
+        Ok(gid) => ros_discovery_mgr.remove_dds_writer(gid),
+        Err(e) => tracing::warn!("DDS Writer {writer}: {e}"),
+    }
+    if let Err(e) = delete_dds_entity(writer) {
+        tracing::warn!("error deleting DDS Writer {writer}: {e}");
     }
 }
 
@@ -132,6 +166,7 @@ impl fmt::Display for RouteSubscriber {
 }
 
 impl RouteSubscriber {
+    /// Route with a fixed Writer QoS, created immediately (action routes).
     #[allow(clippy::too_many_arguments)]
     pub async fn create(
         ros2_name: String,
@@ -141,13 +176,6 @@ impl RouteSubscriber {
         mut writer_qos: Qos,
         context: Context,
     ) -> Result<RouteSubscriber, String> {
-        let transient_local = is_transient_local(&writer_qos);
-        tracing::debug!("Route Subscriber ({zenoh_key_expr} -> {ros2_name}): creation with type {ros2_type} (transient_local:{transient_local})");
-
-        let topic_name = format!("rt{ros2_name}");
-        let type_name = ros2_message_type_to_dds_type(&ros2_type);
-        let queries_timeout = context.config.get_queries_timeout_tl_sub(&ros2_name);
-
         // force RELIABLE QoS for Writers (#23)
         if let Some(cyclors::qos::Reliability {
             kind: cyclors::qos::ReliabilityKind::BEST_EFFORT,
@@ -158,59 +186,67 @@ impl RouteSubscriber {
             // Thus just use default value.
             writer_qos.reliability = None;
         }
-
-        tracing::debug!(
-            "Route Subscriber ({zenoh_key_expr} -> {ros2_name}): create Writer with {writer_qos:?}"
-        );
-        let announce_qos = writer_qos.clone();
-        let dds_writer = create_dds_writer(
-            context.participant,
-            topic_name,
-            type_name,
+        let mut route = Self::new(
+            ros2_name,
+            ros2_type,
+            zenoh_key_expr,
             keyless,
-            writer_qos,
-        )?;
-        // Read back the GUID before keeping the writer; on failure (e.g. transient
-        // BAD_PARAMETER under participant churn) delete the writer instead of
-        // leaking it and leaving a half-created route.
-        let writer_gid = match get_guid(&dds_writer) {
-            Ok(gid) => gid,
-            Err(e) => {
-                let _ = delete_dds_entity(dds_writer);
-                return Err(e);
-            }
-        };
-        context.ros_discovery_mgr.add_dds_writer(writer_gid);
+            writer_qos.clone(),
+            true,
+            context,
+        );
+        route.install_writer(writer_qos)?;
+        Ok(route)
+    }
 
-        // DDS-level local-interest detection: activate this route for ANY
-        // matched reader, whether or not its node declares it in
-        // ros_discovery_info (hector-UI subscriptions and ros2_control
-        // endpoints show up as _NODE_NAME_UNKNOWN_ and were never served).
-        // ignore_local=PARTICIPANT on the writer QoS excludes the bridge's
-        // own readers, so no self-activation loop is possible.
-        {
-            let cb_name = ros2_name.clone();
-            let tx = context.matched_reader_tx.clone();
-            if let Err(e) = attach_publication_matched_listener(dds_writer, move |count| {
-                let _ = tx.try_send((cb_name.clone(), count > 0));
-            }) {
-                tracing::warn!(
-                    "Route Subscriber (Zenoh -> ROS:{ros2_name}): cannot attach \
-                     publication-matched listener (undeclared local readers will \
-                     not be served): {e}"
-                );
-            }
-        }
+    /// Topic route whose Writer QoS follows the announced remote publishers.
+    /// `announce_qos` is announced when undeclared DDS readers activate the route.
+    pub async fn create_for_topic(
+        ros2_name: String,
+        ros2_type: String,
+        zenoh_key_expr: OwnedKeyExpr,
+        keyless: bool,
+        announce_qos: Qos,
+        context: Context,
+    ) -> Result<RouteSubscriber, String> {
+        tracing::debug!(
+            "Route Subscriber ({zenoh_key_expr} -> {ros2_name}): creation with type {ros2_type}"
+        );
+        Ok(Self::new(
+            ros2_name,
+            ros2_type,
+            zenoh_key_expr,
+            keyless,
+            announce_qos,
+            false,
+            context,
+        ))
+    }
 
-        Ok(RouteSubscriber {
+    fn new(
+        ros2_name: String,
+        ros2_type: String,
+        zenoh_key_expr: OwnedKeyExpr,
+        keyless: bool,
+        announce_qos: Qos,
+        fixed_qos: bool,
+        context: Context,
+    ) -> RouteSubscriber {
+        let queries_timeout = context.config.get_queries_timeout_tl_sub(&ros2_name);
+        RouteSubscriber {
             ros2_name,
             ros2_type,
             zenoh_key_expr,
             context,
             zenoh_subscriber: None,
             announce_qos,
-            dds_writer,
-            transient_local,
+            dds_writer: Arc::new(DDS_ENTITY_NULL.into()),
+            writer_qos: None,
+            dds_volatile_writer: Arc::new(DDS_ENTITY_NULL.into()),
+            volatile_writer_qos: None,
+            fixed_qos,
+            remote_writer_qos: BTreeMap::new(),
+            transient_local: false,
             queries_timeout,
             keyless,
             liveliness_token: None,
@@ -218,34 +254,179 @@ impl RouteSubscriber {
             local_nodes: HashSet::new(),
             fwd_msg_count: Arc::new(AtomicU64::new(0)),
             fwd_byte_count: Arc::new(AtomicU64::new(0)),
-        })
+        }
     }
 
-    // Announce the route over Zenoh via a LivelinessToken
-    async fn announce_route(&mut self, discovered_reader_qos: &Qos) -> Result<(), String> {
-        tracing::debug!("{self} activate");
-        // Callback routing message received by Zenoh subscriber to DDS Writer (if set)
+    /// Creates a DDS Writer with `qos` and declares it in ros_discovery_info.
+    fn create_writer(&self, qos: &Qos) -> Result<dds_entity_t, String> {
+        tracing::debug!("{self}: create Writer with {qos:?}");
+        let writer = create_dds_writer(
+            self.context.participant,
+            format!("rt{}", self.ros2_name),
+            ros2_message_type_to_dds_type(&self.ros2_type),
+            self.keyless,
+            qos.clone(),
+        )?;
+        // Read back the GUID before keeping the writer; on failure (e.g. transient
+        // BAD_PARAMETER under participant churn) delete the writer instead of
+        // leaking it and leaving a half-created route.
+        let writer_gid = match get_guid(&writer) {
+            Ok(gid) => gid,
+            Err(e) => {
+                let _ = delete_dds_entity(writer);
+                return Err(e);
+            }
+        };
+        self.context.ros_discovery_mgr.add_dds_writer(writer_gid);
+        Ok(writer)
+    }
+
+    /// Creates, replaces or deletes the VOLATILE Writer serving marked samples.
+    /// Its readers also match the main Writer, so it needs no matched-reader listener.
+    fn set_volatile_writer(&mut self, qos: Option<Qos>) -> Result<(), String> {
+        let same = match (&self.volatile_writer_qos, &qos) {
+            (Some(a), Some(b)) => same_route_qos(a, b, false),
+            (a, b) => a.is_none() && b.is_none(),
+        };
+        if same {
+            return Ok(());
+        }
+        let writer = match &qos {
+            Some(qos) => self.create_writer(qos)?,
+            None => DDS_ENTITY_NULL,
+        };
+        let old = self.dds_volatile_writer.swap(writer, Ordering::Relaxed);
+        if old != DDS_ENTITY_NULL {
+            delete_route_writer(old, &self.context.ros_discovery_mgr);
+        }
+        self.volatile_writer_qos = qos;
+        Ok(())
+    }
+
+    /// Replaces the route's Writer by a new one with `qos`, the old one is deleted last.
+    fn install_writer(&mut self, qos: Qos) -> Result<(), String> {
+        let writer = self.create_writer(&qos)?;
+
+        // Any matched reader activates the route, also readers absent from ros_discovery_info.
+        // ignore_local=PARTICIPANT keeps the bridge's own readers from activating it.
+        {
+            let cb_name = self.ros2_name.clone();
+            let tx = self.context.matched_reader_tx.clone();
+            if let Err(e) = attach_publication_matched_listener(writer, move |count| {
+                let _ = tx.try_send((cb_name.clone(), count > 0));
+            }) {
+                tracing::warn!(
+                    "{self}: cannot attach publication-matched listener (undeclared \
+                     local readers will not be served): {e}"
+                );
+            }
+        }
+
+        let old = self.dds_writer.swap(writer, Ordering::Relaxed);
+        if old != DDS_ENTITY_NULL {
+            delete_route_writer(old, &self.context.ros_discovery_mgr);
+            // the deleted Writer's listener can no longer report its readers leaving
+            if self.local_nodes.contains(MATCHED_READERS_KEY) {
+                let current = self.dds_writer.clone();
+                let tx = self.context.matched_reader_tx.clone();
+                let ros2_name = self.ros2_name.clone();
+                tokio::spawn(async move {
+                    tokio::time::sleep(MATCH_RECHECK_DELAY).await;
+                    if current.load(Ordering::Relaxed) == writer
+                        && publication_matched_count(writer) == Some(0)
+                        && tx.send_async((ros2_name, false)).await.is_err()
+                    {
+                        tracing::debug!("routes manager gone, matched readers re-check dropped");
+                    }
+                });
+            }
+        }
+        self.transient_local = is_transient_local(&qos);
+        self.writer_qos = Some(qos);
+        Ok(())
+    }
+
+    /// Creates or rebuilds the Writer for the announced remote publishers.
+    /// Without any, a TRANSIENT_LOCAL Writer becomes the VOLATILE fallback, as in DDS the history leaves with its publisher.
+    pub async fn update_writer(&mut self) -> Result<(), String> {
+        if self.fixed_qos {
+            return Ok(());
+        }
+        if self.remote_writer_qos.is_empty() {
+            self.set_volatile_writer(None)?;
+            if self.transient_local {
+                self.install_writer(self.fallback_writer_qos())?;
+                if self.zenoh_subscriber.is_some() {
+                    self.undeclare_zenoh_subscriber();
+                    self.declare_zenoh_subscriber().await?;
+                }
+            }
+            return Ok(());
+        }
+        // a failed re-declaration left an active route without zenoh subscriber
+        if !self.local_nodes.is_empty()
+            && self.liveliness_token.is_some()
+            && self.zenoh_subscriber.is_none()
+        {
+            self.declare_zenoh_subscriber().await?;
+        }
+        // remote_publisher_key starts with the announcing bridge's id
+        let remote: Vec<(&str, &Qos)> = self
+            .remote_writer_qos
+            .iter()
+            .map(|(key, qos)| (key.split(':').next().unwrap_or_default(), qos))
+            .collect();
+        let (desired, desired_volatile) = writers_qos_for_remote_writers(&remote);
+        self.set_volatile_writer(desired_volatile)?;
+        if let Some(current) = &self.writer_qos {
+            if same_route_qos(current, &desired, false) {
+                return Ok(());
+            }
+            tracing::info!(
+                "{self}: remote publishers' QoS changed, rebuilding DDS Writer ({} to {})",
+                route_qos_summary(current),
+                route_qos_summary(&desired)
+            );
+        }
+        let was_tl = self.transient_local;
+        self.install_writer(desired)?;
+        if self.zenoh_subscriber.is_some() && (was_tl || self.transient_local) {
+            // re-fetch the remote TL history into the new Writer, matched readers may get it twice
+            self.undeclare_zenoh_subscriber();
+            self.declare_zenoh_subscriber().await?;
+        }
+        Ok(())
+    }
+
+    async fn declare_zenoh_subscriber(&mut self) -> Result<(), String> {
+        // Callback routing message received by Zenoh subscriber to the current DDS Writer
         let ros2_name = self.ros2_name.clone();
-        let dds_writer = self.dds_writer;
+        let dds_writer = self.dds_writer.clone();
+        let dds_volatile_writer = self.dds_volatile_writer.clone();
         let fwd_msg_count = self.fwd_msg_count.clone();
         let fwd_byte_count = self.fwd_byte_count.clone();
         let subscriber_callback = move |s: Sample| {
-            route_zenoh_message_to_dds(s, &ros2_name, dds_writer, &fwd_msg_count, &fwd_byte_count);
+            let volatile = s
+                .attachment()
+                .is_some_and(|a| a.to_bytes().as_ref() == VOLATILE_ATTACHMENT);
+            // a marked sample must stay out of the TRANSIENT_LOCAL history, so it waits for its announcement
+            let writer = if volatile {
+                dds_volatile_writer.load(Ordering::Relaxed)
+            } else {
+                dds_writer.load(Ordering::Relaxed)
+            };
+            route_zenoh_message_to_dds(s, &ros2_name, writer, &fwd_msg_count, &fwd_byte_count);
         };
 
-        // create zenoh subscriber
-        // if Writer is TRANSIENT_LOCAL, use a QueryingSubscriber to fetch remote historical messages to write
+        // a TRANSIENT_LOCAL Writer fetches as much remote history as it keeps
         self.zenoh_subscriber = if self.transient_local {
-            let history_config = match &discovered_reader_qos.history {
-                Some(History { depth, .. }) => {
-                    let depth: usize = (*depth).try_into().unwrap_or(usize::MAX);
-                    HistoryConfig::default()
-                        .detect_late_publishers()
-                        .max_samples(depth)
-                }
-                _other => HistoryConfig::default()
-                    .detect_late_publishers()
-                    .max_samples(1),
+            let max_samples = match self.writer_qos.as_ref().and_then(|q| q.history.as_ref()) {
+                Some(History {
+                    kind: HistoryKind::KEEP_ALL,
+                    ..
+                }) => usize::MAX,
+                Some(History { depth, .. }) => (*depth).max(1) as usize,
+                None => 1,
             };
             let sub = self
                 .context
@@ -254,7 +435,11 @@ impl RouteSubscriber {
                 .advanced()
                 .callback(subscriber_callback)
                 .allowed_origin(Locality::Remote) // Allow only remote publications to avoid loops
-                .history(history_config)
+                .history(
+                    HistoryConfig::default()
+                        .detect_late_publishers()
+                        .max_samples(max_samples),
+                )
                 .query_timeout(self.queries_timeout)
                 .await
                 .map_err(|e| format!("{self}: failed to create FetchingSubscriber: {e}",))?;
@@ -270,6 +455,42 @@ impl RouteSubscriber {
                 .map_err(|e| format!("{self}: failed to create Subscriber: {e}"))?;
             Some(ZSubscriber::Subscriber(sub))
         };
+        Ok(())
+    }
+
+    fn undeclare_zenoh_subscriber(&mut self) {
+        match self.zenoh_subscriber.take() {
+            Some(ZSubscriber::Subscriber(s)) => {
+                if let Err(e) = s.undeclare().wait() {
+                    tracing::debug!("Unable to undeclare subscriber: {:?}", e);
+                }
+            }
+            Some(ZSubscriber::AdvancedSubscriber(s)) => {
+                if let Err(e) = s.undeclare().wait() {
+                    tracing::debug!("Unable to undeclare subscriber: {:?}", e);
+                }
+            }
+            None => {}
+        };
+    }
+
+    /// VOLATILE Writer QoS for publishers that announce nothing (plain zenoh applications), type hash and depth from the local Reader.
+    fn fallback_writer_qos(&self) -> Qos {
+        let qos = Qos {
+            user_data: self.announce_qos.user_data.clone(),
+            history: self.announce_qos.history.clone(),
+            ..Default::default()
+        };
+        writer_qos_for_remote_writers(&[qos])
+    }
+
+    // Announce the route over Zenoh via a LivelinessToken
+    async fn announce_route(&mut self, discovered_reader_qos: &Qos) -> Result<(), String> {
+        tracing::debug!("{self} activate");
+        if !self.fixed_qos && self.dds_writer.load(Ordering::Relaxed) == DDS_ENTITY_NULL {
+            self.install_writer(self.fallback_writer_qos())?;
+        }
+        self.declare_zenoh_subscriber().await?;
 
         // if not for an Action (since actions declare their own liveliness)
         if !is_message_for_action(&self.ros2_name) {
@@ -302,22 +523,11 @@ impl RouteSubscriber {
         tracing::debug!("{self} deactivate");
         // Drop Zenoh Subscriber and Liveliness token
         // The DDS Writer remains to be discovered by local ROS nodes
-        match self.zenoh_subscriber.take() {
-            Some(ZSubscriber::Subscriber(s)) => {
-                if let Err(e) = s.undeclare().wait() {
-                    tracing::debug!("Unable to undeclare subscriber: {:?}", e);
-                }
-            }
-            Some(ZSubscriber::AdvancedSubscriber(s)) => {
-                if let Err(e) = s.undeclare().wait() {
-                    tracing::debug!("Unable to undeclare subscriber: {:?}", e);
-                }
-            }
-            None => {}
-        };
+        self.undeclare_zenoh_subscriber();
         self.liveliness_token = None;
     }
 
+    /// Action routes: a remote route is served (the Writer QoS is fixed).
     #[inline]
     pub fn add_remote_route(&mut self, zenoh_id: &str, zenoh_key_expr: &keyexpr) {
         self.remote_routes
@@ -325,6 +535,22 @@ impl RouteSubscriber {
         tracing::debug!("{self} now serving remote routes {:?}", self.remote_routes);
     }
 
+    /// Topic routes: a remote publisher route was announced with `writer_qos`.
+    pub async fn add_remote_publisher(
+        &mut self,
+        zenoh_id: &str,
+        zenoh_key_expr: &keyexpr,
+        keyless: bool,
+        writer_qos: &Qos,
+    ) -> Result<(), String> {
+        let key = remote_publisher_key(zenoh_id, zenoh_key_expr, keyless, writer_qos);
+        self.remote_routes.insert(key.clone());
+        self.remote_writer_qos.insert(key, writer_qos.clone());
+        tracing::debug!("{self} now serving remote routes {:?}", self.remote_routes);
+        self.update_writer().await
+    }
+
+    /// Action routes: a remote route is no longer served.
     #[inline]
     pub fn remove_remote_route(&mut self, zenoh_id: &str, zenoh_key_expr: &keyexpr) {
         self.remote_routes
@@ -332,12 +558,28 @@ impl RouteSubscriber {
         tracing::debug!("{self} now serving remote routes {:?}", self.remote_routes);
     }
 
-    /// Remove all remote_routes entries for a departed bridge (prefix
-    /// "<zenoh_id>:"). Returns whether any entry was removed.
+    /// Topic routes: a remote publisher announcement was retired, callers then call `update_writer`.
+    /// The QoS identifies it because a re-announcement precedes the retirement of the old one.
+    pub fn remove_remote_publisher(
+        &mut self,
+        zenoh_id: &str,
+        zenoh_key_expr: &keyexpr,
+        keyless: bool,
+        writer_qos: &Qos,
+    ) {
+        let key = remote_publisher_key(zenoh_id, zenoh_key_expr, keyless, writer_qos);
+        self.remote_routes.remove(&key);
+        self.remote_writer_qos.remove(&key);
+        tracing::debug!("{self} now serving remote routes {:?}", self.remote_routes);
+    }
+
+    /// Remove all remote_routes entries for a departed bridge (prefix "<zenoh_id>:").
+    /// Returns whether any entry was removed, callers then call `update_writer`.
     #[inline]
     pub fn prune_remote_routes_with_prefix(&mut self, prefix: &str) -> bool {
         let before = self.remote_routes.len();
         self.remote_routes.retain(|r| !r.starts_with(prefix));
+        self.remote_writer_qos.retain(|r, _| !r.starts_with(prefix));
         if self.remote_routes.len() == before {
             return false;
         }
@@ -407,6 +649,26 @@ impl RouteSubscriber {
     }
 }
 
+/// Identity of a remote publisher announcement, prefixed by "<zenoh_id>:" for pruning.
+fn remote_publisher_key(
+    zenoh_id: &str,
+    zenoh_key_expr: &keyexpr,
+    keyless: bool,
+    writer_qos: &Qos,
+) -> String {
+    format!(
+        "{zenoh_id}:{zenoh_key_expr}:{}",
+        qos_to_key_expr(keyless, writer_qos)
+    )
+}
+
+fn serialize_opt_qos<S>(qos: &Option<Qos>, s: S) -> Result<S::Ok, S::Error>
+where
+    S: serde::Serializer,
+{
+    s.serialize_str(&qos.as_ref().map(route_qos_summary).unwrap_or_default())
+}
+
 fn route_zenoh_message_to_dds(
     s: Sample,
     ros2_name: &str,
@@ -414,6 +676,12 @@ fn route_zenoh_message_to_dds(
     fwd_msg_count: &Arc<AtomicU64>,
     fwd_byte_count: &Arc<AtomicU64>,
 ) {
+    if data_writer == DDS_ENTITY_NULL {
+        tracing::trace!(
+            "Route Subscriber (Zenoh -> ROS:{ros2_name}): no DDS Writer yet, dropping sample"
+        );
+        return;
+    }
     // payload size for traffic accounting (captured before the buffer is moved)
     let payload_len = s.payload().len();
     if *LOG_PAYLOAD {
@@ -450,7 +718,7 @@ fn route_zenoh_message_to_dds(
                     ros2_name,
                     len
                 );
-                // reclaim the payload buffer (was leaked on this path)
+                // reclaim the payload buffer
                 drop(Vec::from_raw_parts(ptr, len, capacity));
                 return;
             }
@@ -472,7 +740,7 @@ fn route_zenoh_message_to_dds(
                     .to_str()
                     .unwrap_or("unrecoverable DDS retcode")
             );
-            // reclaim the payload buffer (was leaked on this path)
+            // reclaim the payload buffer
             drop(Vec::from_raw_parts(ptr, len, capacity));
             return;
         }
@@ -495,9 +763,7 @@ fn route_zenoh_message_to_dds(
                     .to_str()
                     .unwrap_or("unrecoverable DDS retcode")
             );
-            // reclaim the payload buffer (was leaked on this path - and this
-            // path fires repeatedly under congestion, when dds_writecdr times
-            // out on a full reliable history)
+            // reclaim the payload buffer, dds_writecdr times out repeatedly under congestion
             drop(Vec::from_raw_parts(ptr, len, capacity));
             return;
         }
