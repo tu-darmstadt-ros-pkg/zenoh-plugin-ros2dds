@@ -127,7 +127,7 @@ fn spawn_generators(stop: Arc<AtomicBool>) {
         let mut i: u64 = 0;
         while !stop.load(Ordering::Relaxed) {
             // 100 Hz base tick
-            if i % 5 == 0 {
+            if i.is_multiple_of(5) {
                 let _ = blob_pub.publish(&blob); // 20 Hz
                 let _ = canary_pub.publish(&small); // 20 Hz
             }
