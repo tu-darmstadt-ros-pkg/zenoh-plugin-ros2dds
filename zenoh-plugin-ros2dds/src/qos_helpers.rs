@@ -160,7 +160,11 @@ fn route_history(qoses: &[Qos], tl_cache_multiplier: usize) -> History {
     if max.kind == HistoryKind::KEEP_ALL || tl.is_empty() {
         return max;
     }
-    let multiplier = if tl.len() > 1 { tl_cache_multiplier.max(1) as i64 } else { 1 };
+    let multiplier = if tl.len() > 1 {
+        tl_cache_multiplier.max(1) as i64
+    } else {
+        1
+    };
     let depth = tl.iter().sum::<i64>().saturating_mul(multiplier);
     History {
         kind: HistoryKind::KEEP_LAST,
@@ -259,16 +263,19 @@ pub fn writers_qos_for_remote_writers(remote_writers: &[(&str, &Qos)]) -> (Qos, 
     let mixed = |bridge: &str| {
         let (mut tl, mut volatile) = (false, false);
         for (_, q) in remote_writers.iter().filter(|(b, _)| *b == bridge) {
-            *if is_transient_local(q) { &mut tl } else { &mut volatile } = true;
+            *if is_transient_local(q) {
+                &mut tl
+            } else {
+                &mut volatile
+            } = true;
         }
         tl && volatile
     };
     let (moved, kept): (Vec<_>, Vec<_>) = remote_writers
         .iter()
         .partition(|(bridge, q)| !is_transient_local(q) && mixed(bridge));
-    let qoses = |w: Vec<&(&str, &Qos)>| -> Vec<Qos> {
-        w.into_iter().map(|(_, q)| (*q).clone()).collect()
-    };
+    let qoses =
+        |w: Vec<&(&str, &Qos)>| -> Vec<Qos> { w.into_iter().map(|(_, q)| (*q).clone()).collect() };
     let volatile = (!moved.is_empty()).then(|| writer_qos_for_remote_writers(&qoses(moved)));
     (writer_qos_for_remote_writers(&qoses(kept)), volatile)
 }
@@ -349,7 +356,11 @@ pub fn local_writers_disagree(local_writers: &[Qos]) -> bool {
 
 /// Compact human-readable form of the route-relevant QoS (admin space).
 pub fn route_qos_summary(qos: &Qos) -> String {
-    let rel = if is_reliable(qos) { "RELIABLE" } else { "BEST_EFFORT" };
+    let rel = if is_reliable(qos) {
+        "RELIABLE"
+    } else {
+        "BEST_EFFORT"
+    };
     let dur = if is_transient_local(qos) {
         "TRANSIENT_LOCAL"
     } else {
@@ -566,16 +577,25 @@ mod route_qos_tests {
         // the remote Writer keeps the TL publishers' history, the VOLATILE one has none
         assert_eq!(hist(&a), (KL, 2));
         let rev: Vec<Qos> = ws.iter().rev().cloned().collect();
-        assert!(same_route_qos(&a, &announced_qos_for_local_writers(&rev, 1), false));
+        assert!(same_route_qos(
+            &a,
+            &announced_qos_for_local_writers(&rev, 1),
+            false
+        ));
     }
 
     #[test]
     fn transient_local_history_is_summed_over_publishers() {
         // tf_static: 20 static_transform_publishers, each TL KEEP_LAST(1)
-        let tf: Vec<Qos> = (0..20).map(|_| q(Some(true), true, Some((KL, 1)))).collect();
+        let tf: Vec<Qos> = (0..20)
+            .map(|_| q(Some(true), true, Some((KL, 1))))
+            .collect();
         let a = announced_qos_for_local_writers(&tf, 1);
         assert_eq!(hist(&a), (KL, 20));
-        assert_eq!(hist(&reader_qos_for_local_writers(&tf, &Qos::default(), 1)), (KL, 20));
+        assert_eq!(
+            hist(&reader_qos_for_local_writers(&tf, &Qos::default(), 1)),
+            (KL, 20)
+        );
         let w = writer_qos_for_remote_writers(&[a]);
         assert_eq!(rel(&w), ReliabilityKind::RELIABLE);
         assert_eq!(dur(&w), DurabilityKind::TRANSIENT_LOCAL);
@@ -592,7 +612,10 @@ mod route_qos_tests {
     fn single_transient_local_publisher_keeps_its_own_depth() {
         // a late subscriber of a latched /map gets the one map plain DDS would deliver
         let map = [q(Some(true), true, Some((KL, 1)))];
-        assert_eq!(hist(&reader_qos_for_local_writers(&map, &Qos::default(), 10)), (KL, 1));
+        assert_eq!(
+            hist(&reader_qos_for_local_writers(&map, &Qos::default(), 10)),
+            (KL, 1)
+        );
         let w = writer_qos_for_remote_writers(&[announced_qos_for_local_writers(&map, 10)]);
         assert_eq!(hist(&w), (KL, 1));
     }
@@ -617,7 +640,11 @@ mod route_qos_tests {
         assert_eq!(dur(&w), DurabilityKind::TRANSIENT_LOCAL);
         assert_eq!(hist(&w), (KL, 2));
         let rev = [ws[1].clone(), ws[0].clone()];
-        assert!(same_route_qos(&w, &writer_qos_for_remote_writers(&rev), false));
+        assert!(same_route_qos(
+            &w,
+            &writer_qos_for_remote_writers(&rev),
+            false
+        ));
     }
 
     #[test]
@@ -639,10 +666,15 @@ mod route_qos_tests {
     #[test]
     fn summed_depth_is_capped() {
         // /rosout: every node has a TL KEEP_LAST(1000) Writer
-        let rosout: Vec<Qos> = (0..30).map(|_| q(Some(true), true, Some((KL, 1000)))).collect();
+        let rosout: Vec<Qos> = (0..30)
+            .map(|_| q(Some(true), true, Some((KL, 1000))))
+            .collect();
         let a = announced_qos_for_local_writers(&rosout, 1);
         assert_eq!(hist(&a), (KL, MAX_TL_DEPTH));
-        assert_eq!(hist(&writer_qos_for_remote_writers(&[a])), (KL, MAX_TL_DEPTH));
+        assert_eq!(
+            hist(&writer_qos_for_remote_writers(&[a])),
+            (KL, MAX_TL_DEPTH)
+        );
         // the announced depth comes from a remote bridge, it is capped too
         let w = writer_qos_for_remote_writers(&[
             q(Some(true), true, Some((KL, i32::MAX))),
@@ -660,7 +692,11 @@ mod route_qos_tests {
     fn zero_or_negative_keep_last_depth_is_clamped() {
         let w = writer_qos_for_remote_writers(&[q(Some(true), false, Some((KL, 0)))]);
         assert_eq!(hist(&w), (KL, 1));
-        let r = reader_qos_for_local_writers(&[q(Some(true), false, Some((KL, -3)))], &Qos::default(), 1);
+        let r = reader_qos_for_local_writers(
+            &[q(Some(true), false, Some((KL, -3)))],
+            &Qos::default(),
+            1,
+        );
         assert_eq!(hist(&r), (KL, 1));
     }
 
@@ -670,20 +706,47 @@ mod route_qos_tests {
         let mut b = a.clone();
         b.user_data = Some(b"other".to_vec());
         b.reliability.as_mut().unwrap().max_blocking_time += 1;
-        assert!(same_route_qos(&a, &b, false), "user_data and blocking time alone must not force a rebuild");
-        assert!(!same_route_qos(&a, &q(Some(false), true, Some((KL, 1))), false));
-        assert!(!same_route_qos(&a, &q(Some(true), false, Some((KL, 1))), false));
-        assert!(!same_route_qos(&a, &q(Some(true), true, Some((KL, 2))), false));
+        assert!(
+            same_route_qos(&a, &b, false),
+            "user_data and blocking time alone must not force a rebuild"
+        );
+        assert!(!same_route_qos(
+            &a,
+            &q(Some(false), true, Some((KL, 1))),
+            false
+        ));
+        assert!(!same_route_qos(
+            &a,
+            &q(Some(true), false, Some((KL, 1))),
+            false
+        ));
+        assert!(!same_route_qos(
+            &a,
+            &q(Some(true), true, Some((KL, 2))),
+            false
+        ));
     }
 
     #[test]
     fn same_route_qos_treats_unset_as_dds_default() {
         // unset reliability: RELIABLE for a Writer, BEST_EFFORT for a Reader
-        assert!(same_route_qos(&q(None, false, None), &q(Some(true), false, Some((KL, 1))), false));
-        assert!(same_route_qos(&q(None, false, None), &q(Some(false), false, Some((KL, 1))), true));
+        assert!(same_route_qos(
+            &q(None, false, None),
+            &q(Some(true), false, Some((KL, 1))),
+            false
+        ));
+        assert!(same_route_qos(
+            &q(None, false, None),
+            &q(Some(false), false, Some((KL, 1))),
+            true
+        ));
         // unset durability == VOLATILE, unset history == KEEP_LAST(1)
         let mut unset = q(Some(true), false, None);
         unset.durability = None;
-        assert!(same_route_qos(&unset, &q(Some(true), false, Some((KL, 1))), false));
+        assert!(same_route_qos(
+            &unset,
+            &q(Some(true), false, Some((KL, 1))),
+            false
+        ));
     }
 }

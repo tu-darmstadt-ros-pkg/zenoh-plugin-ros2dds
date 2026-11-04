@@ -117,8 +117,7 @@ where
         }
         // Deliver matches made before attachment, a 0 would retire a route whose readers are still matching a rebuilt Writer
         let mut status: dds_publication_matched_status = std::mem::zeroed();
-        if dds_get_publication_matched_status(writer, &mut status) >= 0
-            && status.current_count > 0
+        if dds_get_publication_matched_status(writer, &mut status) >= 0 && status.current_count > 0
         {
             let cb = &*(arg as *const F);
             cb(status.current_count);
@@ -131,7 +130,8 @@ where
 pub fn publication_matched_count(writer: dds_entity_t) -> Option<u32> {
     unsafe {
         let mut status: dds_publication_matched_status = std::mem::zeroed();
-        (dds_get_publication_matched_status(writer, &mut status) >= 0).then_some(status.current_count)
+        (dds_get_publication_matched_status(writer, &mut status) >= 0)
+            .then_some(status.current_count)
     }
 }
 
@@ -331,7 +331,11 @@ struct TransientLocalWriters(Mutex<HashMap<dds_instance_handle_t, bool>>);
 
 impl TransientLocalWriters {
     /// Whether `reader`'s Writer `publication_handle` is TRANSIENT_LOCAL (or stronger).
-    unsafe fn contains(&self, reader: dds_entity_t, publication_handle: dds_instance_handle_t) -> bool {
+    unsafe fn contains(
+        &self,
+        reader: dds_entity_t,
+        publication_handle: dds_instance_handle_t,
+    ) -> bool {
         let mut known = self.0.lock().unwrap_or_else(|p| p.into_inner());
         if let Some(tl) = known.get(&publication_handle) {
             return *tl;

@@ -209,7 +209,9 @@ impl RouteSubscriber {
         announce_qos: Qos,
         context: Context,
     ) -> Result<RouteSubscriber, String> {
-        tracing::debug!("Route Subscriber ({zenoh_key_expr} -> {ros2_name}): creation with type {ros2_type}");
+        tracing::debug!(
+            "Route Subscriber ({zenoh_key_expr} -> {ros2_name}): creation with type {ros2_type}"
+        );
         Ok(Self::new(
             ros2_name,
             ros2_type,
@@ -675,7 +677,9 @@ fn route_zenoh_message_to_dds(
     fwd_byte_count: &Arc<AtomicU64>,
 ) {
     if data_writer == DDS_ENTITY_NULL {
-        tracing::trace!("Route Subscriber (Zenoh -> ROS:{ros2_name}): no DDS Writer yet, dropping sample");
+        tracing::trace!(
+            "Route Subscriber (Zenoh -> ROS:{ros2_name}): no DDS Writer yet, dropping sample"
+        );
         return;
     }
     // payload size for traffic accounting (captured before the buffer is moved)

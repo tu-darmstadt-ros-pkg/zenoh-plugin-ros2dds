@@ -452,7 +452,9 @@ impl RoutePublisher {
             std::thread::Builder::new()
                 .name("ros2dds-fwd".into())
                 .spawn(forwarder)
-                .map_err(|e| format!("Route Publisher ({ros2_name}): failed to spawn forwarder thread: {e}"))?;
+                .map_err(|e| {
+                    format!("Route Publisher ({ros2_name}): failed to spawn forwarder thread: {e}")
+                })?;
         }
 
         let mut route = RoutePublisher {
@@ -683,7 +685,9 @@ impl RoutePublisher {
             self.is_express,
         )
         .await?;
-        let volatile_publisher = self.declare_volatile_publisher(&volatile_reader_qos).await?;
+        let volatile_publisher = self
+            .declare_volatile_publisher(&volatile_reader_qos)
+            .await?;
         // stop reacting to the old publisher's matching, drop the old Readers
         self.undeclare_matching_listener();
         self.deactivate_dds_reader();
@@ -756,7 +760,9 @@ impl RoutePublisher {
         volatile_reader_qos: Option<Qos>,
     ) -> Result<(), String> {
         tracing::info!("{self}: VOLATILE local publishers changed, replacing their Reader");
-        let volatile_publisher = self.declare_volatile_publisher(&volatile_reader_qos).await?;
+        let volatile_publisher = self
+            .declare_volatile_publisher(&volatile_reader_qos)
+            .await?;
         {
             let _guard = self
                 .activation_lock
@@ -956,7 +962,9 @@ fn serialize_reader_qos<S>(qos: &Arc<Mutex<Qos>>, s: S) -> Result<S::Ok, S::Erro
 where
     S: Serializer,
 {
-    s.serialize_str(&route_qos_summary(&qos.lock().unwrap_or_else(|p| p.into_inner())))
+    s.serialize_str(&route_qos_summary(
+        &qos.lock().unwrap_or_else(|p| p.into_inner()),
+    ))
 }
 
 fn serialize_volatile_reader_qos<S>(qos: &Arc<Mutex<Option<Qos>>>, s: S) -> Result<S::Ok, S::Error>
@@ -1083,7 +1091,11 @@ fn activate_dds_readers(
         .unwrap_or_else(|p| p.into_inner())
         .clone();
     let readers = [
-        (dds_reader, Some(reader_qos.lock().unwrap_or_else(|p| p.into_inner()).clone()), false),
+        (
+            dds_reader,
+            Some(reader_qos.lock().unwrap_or_else(|p| p.into_inner()).clone()),
+            false,
+        ),
         (dds_volatile_reader, volatile_qos, true),
     ];
     for (reader, qos, volatile) in readers {
@@ -1092,15 +1104,7 @@ fn activate_dds_readers(
             continue;
         }
         if let Err(e) = activate_dds_reader(
-            reader,
-            ros2_name,
-            ros2_type,
-            route_id,
-            context,
-            keyless,
-            &qos,
-            type_info,
-            fwd_queue,
+            reader, ros2_name, ros2_type, route_id, context, keyless, &qos, type_info, fwd_queue,
             volatile,
         ) {
             tracing::error!("{route_id}: failed to activate DDS Reader: {e}");

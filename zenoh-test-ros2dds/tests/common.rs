@@ -369,12 +369,18 @@ impl Endpoint {
 
     /// `sub` role: number of distinct history messages received.
     pub fn history(&self) -> usize {
-        self.result().get("history").and_then(|v| v.parse().ok()).unwrap_or(0)
+        self.result()
+            .get("history")
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(0)
     }
 
     /// `sub` role: number of live messages received.
     pub fn live(&self) -> usize {
-        self.result().get("live").and_then(|v| v.parse().ok()).unwrap_or(0)
+        self.result()
+            .get("live")
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(0)
     }
 
     /// `sub` role: number of live messages received from publisher `tag`.
@@ -389,7 +395,10 @@ impl Endpoint {
 
     /// `sub` role: number of history messages received more than once.
     pub fn history_dups(&self) -> usize {
-        self.result().get("history_dups").and_then(|v| v.parse().ok()).unwrap_or(0)
+        self.result()
+            .get("history_dups")
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(0)
     }
 
     /// Whether the endpoint runs and has reported, so that zero counts are real.
@@ -414,7 +423,12 @@ impl Endpoint {
     pub fn frames(&self) -> std::collections::BTreeSet<String> {
         self.result()
             .get("frames")
-            .map(|v| v.split(',').filter(|s| !s.is_empty()).map(String::from).collect())
+            .map(|v| {
+                v.split(',')
+                    .filter(|s| !s.is_empty())
+                    .map(String::from)
+                    .collect()
+            })
             .unwrap_or_default()
     }
 
@@ -514,6 +528,7 @@ impl FreezableProxy {
     }
 
     pub fn freeze(&self) {
-        self.frozen.store(true, std::sync::atomic::Ordering::Relaxed);
+        self.frozen
+            .store(true, std::sync::atomic::Ordering::Relaxed);
     }
 }

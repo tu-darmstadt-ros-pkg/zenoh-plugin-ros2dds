@@ -36,7 +36,8 @@ async fn admin_session(port: u16) -> zenoh::Session {
     cfg.insert_json5("mode", "\"client\"").unwrap();
     cfg.insert_json5("connect/endpoints", &format!("[\"tcp/127.0.0.1:{port}\"]"))
         .unwrap();
-    cfg.insert_json5("scouting/multicast/enabled", "false").unwrap();
+    cfg.insert_json5("scouting/multicast/enabled", "false")
+        .unwrap();
     zenoh::open(cfg).await.expect("admin session")
 }
 
@@ -73,8 +74,12 @@ async fn mixed_publishers_case(rd: u32, od: u32, port: u16, first: &str, second:
     let qos = |tag: &str| if tag == "rel" { "rel" } else { "be" };
     let robot = common::create_bridge_with(&robot_bridge_cfg(rd, port)).await;
     let operator = common::create_bridge_with(&operator_bridge_cfg(od, port)).await;
-    let first_pub =
-        Endpoint::spawn(first, rd, &["pub", "/mixed", qos(first), "vol", "10", first]).await;
+    let first_pub = Endpoint::spawn(
+        first,
+        rd,
+        &["pub", "/mixed", qos(first), "vol", "10", first],
+    )
+    .await;
     // the bridge offers RELIABLE, so both subscribers get both publishers
     let subs = [
         Endpoint::spawn("sub_be", od, &["sub", "/mixed", "be", "vol", "10"]).await,
@@ -83,17 +88,23 @@ async fn mixed_publishers_case(rd: u32, od: u32, port: u16, first: &str, second:
     tokio::time::sleep(SETTLE).await;
     let first_before: Vec<usize> = subs.iter().map(|s| s.live_from(first)).collect();
 
-    let second_pub =
-        Endpoint::spawn(second, rd, &["pub", "/mixed", qos(second), "vol", "10", second]).await;
+    let second_pub = Endpoint::spawn(
+        second,
+        rd,
+        &["pub", "/mixed", qos(second), "vol", "10", second],
+    )
+    .await;
     tokio::time::sleep(SETTLE).await;
     let first_mid: Vec<usize> = subs.iter().map(|s| s.live_from(first)).collect();
     let second_mid: Vec<usize> = subs.iter().map(|s| s.live_from(second)).collect();
 
-
     second_pub.stop().await;
     tokio::time::sleep(SETTLE).await;
     let first_after: Vec<usize> = subs.iter().map(|s| s.live_from(first)).collect();
-    let raws: Vec<String> = subs.iter().map(|s| format!("{}: {}", s.label, s.raw_result())).collect();
+    let raws: Vec<String> = subs
+        .iter()
+        .map(|s| format!("{}: {}", s.label, s.raw_result()))
+        .collect();
 
     for s in subs {
         s.stop().await;
@@ -104,8 +115,14 @@ async fn mixed_publishers_case(rd: u32, od: u32, port: u16, first: &str, second:
 
     for (i, raw) in raws.iter().enumerate() {
         let ctx = format!("first={first} second={second}, {raw}");
-        assert!(first_before[i] > 0, "first publisher never forwarded ({ctx})");
-        assert!(second_mid[i] > 0, "second publisher never forwarded ({ctx})");
+        assert!(
+            first_before[i] > 0,
+            "first publisher never forwarded ({ctx})"
+        );
+        assert!(
+            second_mid[i] > 0,
+            "second publisher never forwarded ({ctx})"
+        );
         assert!(
             first_mid[i] > first_before[i],
             "first publisher stopped flowing when the second joined ({ctx})"
@@ -180,16 +197,24 @@ async fn two_publisher_bridges_with_different_durability() {
     // collect, so that a failure does not hide the later checks
     let mut failures = Vec::new();
     if tl_hist != 5 {
-        failures.push(format!("late TL subscriber missed the TL publisher's history: {tl_raw}"));
+        failures.push(format!(
+            "late TL subscriber missed the TL publisher's history: {tl_raw}"
+        ));
     }
     if tl_b == 0 {
-        failures.push(format!("late TL subscriber got no live data from b: {tl_raw}"));
+        failures.push(format!(
+            "late TL subscriber got no live data from b: {tl_raw}"
+        ));
     }
     if tl_hist_a != 0 {
-        failures.push(format!("VOLATILE publisher a's messages arrived as history: {tl_raw}"));
+        failures.push(format!(
+            "VOLATILE publisher a's messages arrived as history: {tl_raw}"
+        ));
     }
     if a_after <= a_mid {
-        failures.push(format!("volatile publisher stopped flowing after the TL bridge left: {vol_raw}"));
+        failures.push(format!(
+            "volatile publisher stopped flowing after the TL bridge left: {vol_raw}"
+        ));
     }
     assert!(failures.is_empty(), "\n  - {}", failures.join("\n  - "));
 }
@@ -212,8 +237,13 @@ async fn subscriber_departure_keeps_route_serving_remaining_qos() {
     tokio::time::sleep(SETTLE).await;
     let tl2 = Endpoint::spawn("tl2", od, &["sub", "/leave", "rel", "tl", "1000"]).await;
     tokio::time::sleep(SETTLE).await;
-    let (h, l, raw, vol_raw, vol_live) =
-        (tl2.history(), tl2.live(), tl2.raw_result(), vol.raw_result(), vol.live());
+    let (h, l, raw, vol_raw, vol_live) = (
+        tl2.history(),
+        tl2.live(),
+        tl2.raw_result(),
+        vol.raw_result(),
+        vol.live(),
+    );
 
     tl2.stop().await;
     vol.stop().await;
@@ -222,8 +252,14 @@ async fn subscriber_departure_keeps_route_serving_remaining_qos() {
     common::close_bridge(robot).await;
 
     assert!(vol_live > 0, "volatile subscriber got no data: {vol_raw}");
-    assert_eq!(h, 5, "TL subscriber joining after another left missed the history: {raw}");
-    assert!(l > 0, "TL subscriber joining after another left got no live data: {raw}");
+    assert_eq!(
+        h, 5,
+        "TL subscriber joining after another left missed the history: {raw}"
+    );
+    assert!(
+        l > 0,
+        "TL subscriber joining after another left got no live data: {raw}"
+    );
 }
 
 /// The subscriber-side Writer follows the remote publishers while subscribers stay connected.
@@ -253,27 +289,60 @@ async fn subscriber_writer_rebuilds_follow_remote_publishers() {
     tokio::time::sleep(SETTLE).await;
     let r = sub_route(&admin, "rebuild").await;
     let g1 = field(&r, "dds_writer");
-    check(!g1.is_empty(), format!("no Writer for a VOLATILE publisher: {r}"));
-    check(field(&r, "writer_qos").contains("VOLATILE"), format!("Writer not VOLATILE: {r}"));
-    check(tl_sub.live() == 0, format!("TL sub matched a VOLATILE-only route: {}", tl_sub.raw_result()));
+    check(
+        !g1.is_empty(),
+        format!("no Writer for a VOLATILE publisher: {r}"),
+    );
+    check(
+        field(&r, "writer_qos").contains("VOLATILE"),
+        format!("Writer not VOLATILE: {r}"),
+    );
+    check(
+        tl_sub.live() == 0,
+        format!(
+            "TL sub matched a VOLATILE-only route: {}",
+            tl_sub.raw_result()
+        ),
+    );
 
     // 2. publisher gone, a VOLATILE Writer is kept
     pub_v.stop().await;
     tokio::time::sleep(SETTLE).await;
     let r = sub_route(&admin, "rebuild").await;
-    check(field(&r, "dds_writer") == g1, format!("Writer rebuilt with no publisher left: {r}"));
+    check(
+        field(&r, "dds_writer") == g1,
+        format!("Writer rebuilt with no publisher left: {r}"),
+    );
 
     // 3. TL publisher: upgrade while the TL subscriber waits
     let pub_t = Endpoint::spawn("t", rd, &["pub", "/rebuild", "rel", "tl", "100", "t"]).await;
     tokio::time::sleep(SETTLE + SETTLE).await;
     let r = sub_route(&admin, "rebuild").await;
     let g2 = field(&r, "dds_writer");
-    check(g2 != g1 && !g2.is_empty(), format!("no rebuild VOLATILE -> TL: {r}"));
-    check(field(&r, "writer_qos").contains("TRANSIENT_LOCAL"), format!("Writer not TL: {r}"));
-    check(field(&r, "is_active") == "true", format!("route not active: {r}"));
-    check(tl_sub.history_from("t") == 5, format!("waiting TL sub missed t's history: {}", tl_sub.raw_result()));
-    check(tl_sub.live_from("t") > 0, format!("waiting TL sub got no data from t: {}", tl_sub.raw_result()));
-    check(vol_sub.live_from("t") > 0, format!("VOLATILE sub got no data from t: {}", vol_sub.raw_result()));
+    check(
+        g2 != g1 && !g2.is_empty(),
+        format!("no rebuild VOLATILE -> TL: {r}"),
+    );
+    check(
+        field(&r, "writer_qos").contains("TRANSIENT_LOCAL"),
+        format!("Writer not TL: {r}"),
+    );
+    check(
+        field(&r, "is_active") == "true",
+        format!("route not active: {r}"),
+    );
+    check(
+        tl_sub.history_from("t") == 5,
+        format!("waiting TL sub missed t's history: {}", tl_sub.raw_result()),
+    );
+    check(
+        tl_sub.live_from("t") > 0,
+        format!("waiting TL sub got no data from t: {}", tl_sub.raw_result()),
+    );
+    check(
+        vol_sub.live_from("t") > 0,
+        format!("VOLATILE sub got no data from t: {}", vol_sub.raw_result()),
+    );
 
     // 4. deeper TL publisher on the same robot: depth upgrade while matched
     let t_before = tl_sub.live_from("t");
@@ -281,9 +350,21 @@ async fn subscriber_writer_rebuilds_follow_remote_publishers() {
     tokio::time::sleep(SETTLE + SETTLE).await;
     let r = sub_route(&admin, "rebuild").await;
     let g3 = field(&r, "dds_writer");
-    check(g3 != g2, format!("no rebuild on deeper remote history: {r}"));
-    check(tl_sub.history_from("u") == 5, format!("TL sub missed u's history: {}", tl_sub.raw_result()));
-    check(tl_sub.live_from("t") > t_before, format!("t stopped flowing across the rebuild: {}", tl_sub.raw_result()));
+    check(
+        g3 != g2,
+        format!("no rebuild on deeper remote history: {r}"),
+    );
+    check(
+        tl_sub.history_from("u") == 5,
+        format!("TL sub missed u's history: {}", tl_sub.raw_result()),
+    );
+    check(
+        tl_sub.live_from("t") > t_before,
+        format!(
+            "t stopped flowing across the rebuild: {}",
+            tl_sub.raw_result()
+        ),
+    );
 
     // 5. deeper publisher leaves: downgrade, t keeps flowing
     pub_u.stop().await;
@@ -292,35 +373,65 @@ async fn subscriber_writer_rebuilds_follow_remote_publishers() {
     tokio::time::sleep(SETTLE).await;
     let r = sub_route(&admin, "rebuild").await;
     let g4 = field(&r, "dds_writer");
-    check(g4 != g3, format!("no rebuild after the deeper publisher left: {r}"));
-    check(tl_sub.live_from("t") > t_mid, format!("t stopped flowing after the downgrade: {}", tl_sub.raw_result()));
+    check(
+        g4 != g3,
+        format!("no rebuild after the deeper publisher left: {r}"),
+    );
+    check(
+        tl_sub.live_from("t") > t_mid,
+        format!(
+            "t stopped flowing after the downgrade: {}",
+            tl_sub.raw_result()
+        ),
+    );
     // each rebuild on either bridge may replay the history once, 3 transitions x 2 bridges x 2 tags x 5
     let dups = tl_sub.history_dups();
-    check(dups <= 60, format!("excessive history re-delivery: {}", tl_sub.raw_result()));
+    check(
+        dups <= 60,
+        format!("excessive history re-delivery: {}", tl_sub.raw_result()),
+    );
     tokio::time::sleep(SETTLE + SETTLE).await;
     check(
         tl_sub.history_dups() == dups,
-        format!("history re-delivered while nothing changed (loop): {dups} -> {}", tl_sub.raw_result()),
+        format!(
+            "history re-delivered while nothing changed (loop): {dups} -> {}",
+            tl_sub.raw_result()
+        ),
     );
 
     // 6. a publisher with t's QoS joins, the shared history is (100 + 100) x multiplier 10
-    check(tl_depth(&r) == Some(100), format!("Writer not sized for t alone: {r}"));
+    check(
+        tl_depth(&r) == Some(100),
+        format!("Writer not sized for t alone: {r}"),
+    );
     let pub_t2 = Endpoint::spawn("t2", rd, &["pub", "/rebuild", "rel", "tl", "100", "t2"]).await;
     tokio::time::sleep(SETTLE + SETTLE).await;
     let r = sub_route(&admin, "rebuild").await;
-    check(tl_depth(&r) == Some(2000), format!("Writer not sized for t and t2: {r}"));
+    check(
+        tl_depth(&r) == Some(2000),
+        format!("Writer not sized for t and t2: {r}"),
+    );
     let late = Endpoint::spawn("late", od, &["sub", "/rebuild", "rel", "tl", "1000"]).await;
     tokio::time::sleep(SETTLE).await;
     // t's own history was evicted by its live messages long ago
-    check(late.history_from("t2") == 5, format!("late TL sub missed t2's history: {}", late.raw_result()));
-    check(late.live_from("t") > 0, format!("late TL sub got no data from t: {}", late.raw_result()));
+    check(
+        late.history_from("t2") == 5,
+        format!("late TL sub missed t2's history: {}", late.raw_result()),
+    );
+    check(
+        late.live_from("t") > 0,
+        format!("late TL sub got no data from t: {}", late.raw_result()),
+    );
 
     // 7. no publisher left, as in DDS the history leaves with its publishers
     pub_t.stop().await;
     pub_t2.stop().await;
     tokio::time::sleep(SETTLE).await;
     let r = sub_route(&admin, "rebuild").await;
-    check(field(&r, "writer_qos").contains("VOLATILE"), format!("TL Writer kept without publisher: {r}"));
+    check(
+        field(&r, "writer_qos").contains("VOLATILE"),
+        format!("TL Writer kept without publisher: {r}"),
+    );
 
     for e in [late, vol_sub, tl_sub] {
         e.stop().await;
@@ -361,8 +472,14 @@ async fn route_retires_after_downgrade_when_last_subscriber_leaves() {
     common::close_bridge(operator).await;
     common::close_bridge(robot).await;
 
-    assert!(got_t > 0, "TL subscriber got nothing from the TL publisher: {sub_raw}");
-    assert_eq!(got_v, 0, "TL subscriber matched a VOLATILE-only route: {sub_raw}");
+    assert!(
+        got_t > 0,
+        "TL subscriber got nothing from the TL publisher: {sub_raw}"
+    );
+    assert_eq!(
+        got_v, 0,
+        "TL subscriber matched a VOLATILE-only route: {sub_raw}"
+    );
     assert!(
         field(&r, "is_active") != "true" && !common::route_serves_node(&r, "<matched_dds_readers>"),
         "route still active / serving matched readers after its last subscriber left: {r}"
@@ -414,8 +531,14 @@ async fn plain_zenoh_publisher_survives_bridge_publisher_leaving() {
     common::close_bridge(operator).await;
     common::close_bridge(robot).await;
 
-    assert!(z_before > 0 && b_before > 0, "no data from both publishers: {raw}");
-    assert!(z_after > z_mid, "plain zenoh data stopped after the bridge publisher left: {raw}");
+    assert!(
+        z_before > 0 && b_before > 0,
+        "no data from both publishers: {raw}"
+    );
+    assert!(
+        z_after > z_mid,
+        "plain zenoh data stopped after the bridge publisher left: {raw}"
+    );
 }
 
 /// After an ungraceful loss of the only TL publisher's bridge, the subscriber-side Writer follows the remaining VOLATILE publisher.
@@ -447,7 +570,8 @@ async fn writer_follows_remaining_publishers_after_bridge_loss() {
     // lease expiry plus one retry tick
     let deadline = std::time::Instant::now() + Duration::from_secs(40);
     let mut after = sub_route(&admin, "lost").await;
-    while !field(&after, "writer_qos").contains("VOLATILE") && std::time::Instant::now() < deadline {
+    while !field(&after, "writer_qos").contains("VOLATILE") && std::time::Instant::now() < deadline
+    {
         tokio::time::sleep(Duration::from_secs(1)).await;
         after = sub_route(&admin, "lost").await;
     }
@@ -463,9 +587,18 @@ async fn writer_follows_remaining_publishers_after_bridge_loss() {
     common::close_bridge(robot_a).await;
     common::close_bridge(operator).await;
 
-    assert!(field(&before, "writer_qos").contains("TRANSIENT_LOCAL"), "Writer not TL with a TL publisher: {before}");
-    assert!(field(&after, "writer_qos").contains("VOLATILE"), "Writer still TL after its TL publisher's bridge was lost: {after}");
-    assert!(a_after > a_mid, "a stopped flowing after the other bridge was lost: {raw}");
+    assert!(
+        field(&before, "writer_qos").contains("TRANSIENT_LOCAL"),
+        "Writer not TL with a TL publisher: {before}"
+    );
+    assert!(
+        field(&after, "writer_qos").contains("VOLATILE"),
+        "Writer still TL after its TL publisher's bridge was lost: {after}"
+    );
+    assert!(
+        a_after > a_mid,
+        "a stopped flowing after the other bridge was lost: {raw}"
+    );
 }
 
 /// A node's second TL Writer on a topic counts for the bridged history, joining and leaving.
@@ -499,7 +632,19 @@ async fn second_writer_of_a_node_sizes_the_history() {
     common::close_bridge(robot).await;
 
     // a single Writer keeps its own depth, (3 + 3) x multiplier 10 for two
-    assert_eq!(tl_depth(&first), Some(3), "Writer not sized for one Writer: {first}");
-    assert_eq!(tl_depth(&both), Some(60), "Writer not sized for both Writers: {both}");
-    assert_eq!(tl_depth(&one), Some(3), "Writer not resized after one Writer left: {one}");
+    assert_eq!(
+        tl_depth(&first),
+        Some(3),
+        "Writer not sized for one Writer: {first}"
+    );
+    assert_eq!(
+        tl_depth(&both),
+        Some(60),
+        "Writer not sized for both Writers: {both}"
+    );
+    assert_eq!(
+        tl_depth(&one),
+        Some(3),
+        "Writer not resized after one Writer left: {one}"
+    );
 }

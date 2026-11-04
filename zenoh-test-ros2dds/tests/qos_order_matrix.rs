@@ -72,10 +72,22 @@ enum Order {
 }
 
 const ALL_Q: [Q; 4] = [
-    Q { reliable: true, transient_local: true },
-    Q { reliable: true, transient_local: false },
-    Q { reliable: false, transient_local: true },
-    Q { reliable: false, transient_local: false },
+    Q {
+        reliable: true,
+        transient_local: true,
+    },
+    Q {
+        reliable: true,
+        transient_local: false,
+    },
+    Q {
+        reliable: false,
+        transient_local: true,
+    },
+    Q {
+        reliable: false,
+        transient_local: false,
+    },
 ];
 const ALL_ORDERS: [Order; 3] = [Order::PubFirst, Order::SubFirst, Order::BridgesLast];
 
@@ -154,7 +166,9 @@ async fn run_case(case: &Case) -> Vec<String> {
     // DDS durability semantics, the bridge always offers RELIABLE
     let sub1_should_match = !(case.sub1.transient_local && !case.publ.transient_local);
     if sub1_should_match && sub1.live() == 0 {
-        failures.push(format!("{name}: sub1 got no live data but should match{ctx}"));
+        failures.push(format!(
+            "{name}: sub1 got no live data but should match{ctx}"
+        ));
     }
     if !sub1_should_match && sub1.live() + sub1.history() > 0 {
         failures.push(format!(
@@ -198,7 +212,12 @@ async fn bridged_qos_is_independent_of_start_order() {
         for sub1 in ALL_Q {
             for order in ALL_ORDERS {
                 let index = cases.len();
-                cases.push(Case { index, publ, sub1, order });
+                cases.push(Case {
+                    index,
+                    publ,
+                    sub1,
+                    order,
+                });
             }
         }
     }
@@ -267,7 +286,11 @@ async fn plain_dds_oracle() {
                 let compatible = (publ.reliable || !sub.reliable)
                     && (publ.transient_local || !sub.transient_local);
                 let mut f = Vec::new();
-                let want_history = if dds_delivers_history(publ, sub) { HISTORY_MSGS } else { 0 };
+                let want_history = if dds_delivers_history(publ, sub) {
+                    HISTORY_MSGS
+                } else {
+                    0
+                };
                 if history != want_history {
                     f.push(format!(
                         "pub={} sub={}: history {history} != {want_history}: {raw}",

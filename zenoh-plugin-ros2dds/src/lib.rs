@@ -738,12 +738,14 @@ impl ROS2PluginRuntime {
                 ),
             ("MP/", SampleKind::Delete) => parse_ke_liveliness_pub(liveliness_ke)
                 .map_err(|e| format!("Received invalid liveliness token: {e}"))
-                .map(|(zenoh_id, zenoh_key_expr, _, keyless, writer_qos)| RetiredMsgPub {
-                    zenoh_id,
-                    zenoh_key_expr,
-                    keyless,
-                    writer_qos,
-                }),
+                .map(
+                    |(zenoh_id, zenoh_key_expr, _, keyless, writer_qos)| RetiredMsgPub {
+                        zenoh_id,
+                        zenoh_key_expr,
+                        keyless,
+                        writer_qos,
+                    },
+                ),
             ("MS/", SampleKind::Put) => parse_ke_liveliness_sub(liveliness_ke)
                 .map_err(|e| format!("Received invalid liveliness token: {e}"))
                 .map(
@@ -1031,9 +1033,10 @@ fn msg_route_id(evt: &ROS2AnnouncementEvent) -> Option<String> {
 
 #[cfg(test)]
 mod msg_route_id_tests {
-    use super::*;
     use cyclors::qos::{Durability, DurabilityKind, Qos};
     use zenoh::key_expr::OwnedKeyExpr;
+
+    use super::*;
 
     fn ke(s: &str) -> OwnedKeyExpr {
         OwnedKeyExpr::try_from(s.to_string()).unwrap()

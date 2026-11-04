@@ -43,5 +43,8 @@ async fn non_ascii_liveliness_token_is_ignored() {
     let _ = peer.close().await;
     common::close_bridge(bridge).await;
 
-    assert!(alive, "the plugin stopped answering after a non-ASCII liveliness token");
+    assert!(
+        alive,
+        "the plugin stopped answering after a non-ASCII liveliness token"
+    );
 }

@@ -146,7 +146,12 @@ async fn volatile_publisher_keeps_static_frames() {
             &["tf_stream", "/tf_dedup", "rel", "tl", "1", "tick"],
         )
         .await,
-        Endpoint::spawn("v", robot_domain, &["tf_pub", "/tf_dedup", "rel", "vol", "1", "v"]).await,
+        Endpoint::spawn(
+            "v",
+            robot_domain,
+            &["tf_pub", "/tf_dedup", "rel", "vol", "1", "v"],
+        )
+        .await,
     ];
     let robot = common::create_bridge_with(&robot_bridge_cfg(robot_domain, port)).await;
     let flood = Endpoint::spawn(
@@ -190,7 +195,9 @@ async fn volatile_publisher_keeps_static_frames() {
         failures.push("VOLATILE listener got nothing from the VOLATILE publisher".to_string());
     }
     if !(20.0..=75.0).contains(&tick_rate) {
-        failures.push(format!("VOLATILE listener got {tick_rate:.0} ticks/s of 50/s"));
+        failures.push(format!(
+            "VOLATILE listener got {tick_rate:.0} ticks/s of 50/s"
+        ));
     }
 
     for e in [ticks, b, live, a, flood] {

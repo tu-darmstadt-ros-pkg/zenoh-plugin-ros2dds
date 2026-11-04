@@ -33,8 +33,11 @@ async fn stalled_link_does_not_block_runtime() {
     let logbuf = LogBuf::install();
 
     let mut scfg = zenoh::Config::default();
-    scfg.insert_json5("listen/endpoints", &format!("[\"tcp/127.0.0.1:{SESSION_PORT}\"]"))
-        .unwrap();
+    scfg.insert_json5(
+        "listen/endpoints",
+        &format!("[\"tcp/127.0.0.1:{SESSION_PORT}\"]"),
+    )
+    .unwrap();
     scfg.insert_json5("scouting/multicast/enabled", "false")
         .unwrap();
     let session = zenoh::open(scfg).await.unwrap();
@@ -85,7 +88,10 @@ async fn stalled_link_does_not_block_runtime() {
 
     let deadline = Instant::now() + Duration::from_secs(20);
     while received.load(Ordering::Relaxed) == 0 {
-        assert!(Instant::now() < deadline, "no data crossed the bridge before the stall");
+        assert!(
+            Instant::now() < deadline,
+            "no data crossed the bridge before the stall"
+        );
         tokio::time::sleep(Duration::from_millis(100)).await;
     }
 
@@ -115,7 +121,10 @@ async fn stalled_link_does_not_block_runtime() {
     let max_gap = *max_gap.lock().unwrap();
     let _ = tokio::time::timeout(Duration::from_secs(10), common::close_bridge(bridge)).await;
 
-    assert!(congested, "the stalled link never blocked a RELIABLE put, the test has no teeth");
+    assert!(
+        congested,
+        "the stalled link never blocked a RELIABLE put, the test has no teeth"
+    );
     assert!(
         max_gap < Duration::from_secs(1),
         "the bridge's runtime stalled for {max_gap:?} while the link was frozen"

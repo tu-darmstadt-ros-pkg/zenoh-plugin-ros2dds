@@ -62,7 +62,10 @@ struct SubStats {
 }
 
 fn by_tag(m: &BTreeMap<String, usize>) -> String {
-    m.iter().map(|(t, n)| format!("{t}:{n}")).collect::<Vec<_>>().join(",")
+    m.iter()
+        .map(|(t, n)| format!("{t}:{n}"))
+        .collect::<Vec<_>>()
+        .join(",")
 }
 
 impl SubStats {
@@ -185,7 +188,9 @@ fn main() {
             t.header.frame_id = "base_link".to_string();
             t.child_frame_id = tag;
             t.transform.rotation.w = 1.0;
-            let msg = r2r::tf2_msgs::msg::TFMessage { transforms: vec![t] };
+            let msg = r2r::tf2_msgs::msg::TFMessage {
+                transforms: vec![t],
+            };
             publisher.publish(&msg).expect("publish");
             say("READY");
             while !stopping() {
@@ -202,7 +207,13 @@ fn main() {
                 .subscribe::<r2r::std_msgs::msg::String>(topic, profile)
                 .expect("subscribe");
             let mut stats = SubStats::default();
-            run_subscriber(&mut node, &mut stream, &mut stats, |s, m| s.record(&m.data), |s| s.line());
+            run_subscriber(
+                &mut node,
+                &mut stream,
+                &mut stats,
+                |s, m| s.record(&m.data),
+                |s| s.line(),
+            );
         }
         "tf_sub" => {
             let mut stream = node
@@ -221,7 +232,11 @@ fn main() {
                 |f| {
                     let names: Vec<&str> = f.keys().map(|s| s.as_str()).collect();
                     let counts: Vec<String> = f.iter().map(|(k, n)| format!("{k}:{n}")).collect();
-                    format!("RESULT frames={} counts={}", names.join(","), counts.join(","))
+                    format!(
+                        "RESULT frames={} counts={}",
+                        names.join(","),
+                        counts.join(",")
+                    )
                 },
             );
         }
