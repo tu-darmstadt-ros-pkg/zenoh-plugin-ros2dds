@@ -477,6 +477,177 @@ pub fn operator_bridge_cfg(operator_domain: u32, port: u16) -> BridgeConfig {
     BridgeConfig::new(operator_domain).connect(format!("tcp/127.0.0.1:{port}"))
 }
 
+/// Calls the AddTwoInts service `service` from a `service_caller` on `domain`, returns its verdict line.
+pub async fn call_service(domain: u32, service: &str) -> String {
+    run_caller(
+        env!("CARGO_BIN_EXE_service_caller"),
+        domain,
+        "SERVICE_NAME",
+        service,
+    )
+    .await
+}
+
+/// Sends a Fibonacci goal to `action` from an `action_caller` on `domain`, returns its verdict line.
+pub async fn call_action(domain: u32, action: &str) -> String {
+    run_caller(
+        env!("CARGO_BIN_EXE_action_caller"),
+        domain,
+        "ACTION_NAME",
+        action,
+    )
+    .await
+}
+
+async fn run_caller(bin: &str, domain: u32, name_var: &str, name: &str) -> String {
+    let out = tokio::process::Command::new(bin)
+        .env("ROS_DOMAIN_ID", domain.to_string())
+        .env("RMW_IMPLEMENTATION", "rmw_cyclonedds_cpp")
+        .env("CYCLONEDDS_URI", base_cyclonedds_uri())
+        .env(name_var, name)
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::null())
+        .kill_on_drop(true)
+        .output();
+    let out = tokio::time::timeout(time::Duration::from_secs(70), out)
+        .await
+        .expect("caller process timed out")
+        .expect("caller process failed to run");
+    String::from_utf8_lossy(&out.stdout).trim().to_string()
+}
+
+/// Polls `cond` every 100 ms until it holds or `timeout` passes, returns whether it held.
+pub async fn eventually(timeout: time::Duration, mut cond: impl FnMut() -> bool) -> bool {
+    let deadline = time::Instant::now() + timeout;
+    while !cond() {
+        if time::Instant::now() >= deadline {
+            return false;
+        }
+        tokio::time::sleep(time::Duration::from_millis(100)).await;
+    }
+    true
+}
+
+/// Raw DDS participant that observes the endpoints of all participants on its domain, the bridges' included.
+/// Create it after the bridges of its domain, the first participant of a domain fixes its configuration.
+pub struct DdsProbe {
+    participant: cyclors::dds_entity_t,
+    publications: cyclors::dds_entity_t,
+    subscriptions: cyclors::dds_entity_t,
+}
+
+impl DdsProbe {
+    pub fn new(domain: u32) -> DdsProbe {
+        unsafe {
+            let participant =
+                cyclors::dds_create_participant(domain, std::ptr::null(), std::ptr::null());
+            assert!(
+                participant > 0,
+                "probe participant creation failed: {participant}"
+            );
+            let builtin_reader = |topic| {
+                let reader = cyclors::dds_create_reader(
+                    participant,
+                    topic,
+                    std::ptr::null(),
+                    std::ptr::null(),
+                );
+                assert!(reader > 0, "probe builtin reader creation failed: {reader}");
+                reader
+            };
+            DdsProbe {
+                participant,
+                publications: builtin_reader(cyclors::DDS_BUILTIN_TOPIC_DCPSPUBLICATION),
+                subscriptions: builtin_reader(cyclors::DDS_BUILTIN_TOPIC_DCPSSUBSCRIPTION),
+            }
+        }
+    }
+
+    /// Alive DDS Writers on the DDS topic `topic`, e.g. "rt/chatter".
+    pub fn writers(&self, topic: &str) -> usize {
+        count_alive_endpoints(self.publications, topic)
+    }
+
+    /// Alive DDS Readers on the DDS topic `topic`.
+    pub fn readers(&self, topic: &str) -> usize {
+        count_alive_endpoints(self.subscriptions, topic)
+    }
+
+    /// RELIABLE TRANSIENT_LOCAL std_msgs/String Reader on `topic`, as e_stop_manager subscribes.
+    pub fn transient_local_reader(&self, topic: &str) -> cyclors::dds_entity_t {
+        unsafe {
+            let name = std::ffi::CString::new(topic).unwrap().into_raw();
+            let typ = std::ffi::CString::new("std_msgs::msg::dds_::String_")
+                .unwrap()
+                .into_raw();
+            let t = cyclors::cdds_create_blob_topic(self.participant, name, typ, true);
+            drop(std::ffi::CString::from_raw(name));
+            drop(std::ffi::CString::from_raw(typ));
+            assert!(t > 0, "probe topic creation failed: {t}");
+            let qos = cyclors::dds_create_qos();
+            cyclors::dds_qset_reliability(
+                qos,
+                cyclors::dds_reliability_kind_DDS_RELIABILITY_RELIABLE,
+                100_000_000,
+            );
+            cyclors::dds_qset_durability(
+                qos,
+                cyclors::dds_durability_kind_DDS_DURABILITY_TRANSIENT_LOCAL,
+            );
+            let reader = cyclors::dds_create_reader(self.participant, t, qos, std::ptr::null());
+            cyclors::dds_delete_qos(qos);
+            assert!(reader > 0, "probe reader creation failed: {reader}");
+            reader
+        }
+    }
+
+    /// Writers that `reader` ever rejected for incompatible QoS.
+    pub fn incompatible_writers(reader: cyclors::dds_entity_t) -> u32 {
+        unsafe {
+            let mut status: cyclors::dds_requested_incompatible_qos_status_t = std::mem::zeroed();
+            let ret = cyclors::dds_get_requested_incompatible_qos_status(reader, &mut status);
+            assert!(ret >= 0, "requested incompatible QoS status failed: {ret}");
+            status.total_count
+        }
+    }
+}
+
+impl Drop for DdsProbe {
+    fn drop(&mut self) {
+        unsafe {
+            cyclors::dds_delete(self.participant);
+        }
+    }
+}
+
+fn count_alive_endpoints(builtin_reader: cyclors::dds_entity_t, topic: &str) -> usize {
+    const MAX: usize = 4096;
+    unsafe {
+        let mut samples = vec![std::ptr::null_mut::<std::os::raw::c_void>(); MAX];
+        let mut infos = vec![std::mem::zeroed::<cyclors::dds_sample_info_t>(); MAX];
+        let n = cyclors::dds_read_mask(
+            builtin_reader,
+            samples.as_mut_ptr(),
+            infos.as_mut_ptr(),
+            MAX,
+            MAX as u32,
+            cyclors::DDS_ANY_SAMPLE_STATE
+                | cyclors::DDS_ANY_VIEW_STATE
+                | cyclors::DDS_ALIVE_INSTANCE_STATE,
+        );
+        assert!(n >= 0, "reading builtin topic failed: {n}");
+        let count = samples[..n as usize]
+            .iter()
+            .filter(|s| {
+                let e = **s as *const cyclors::dds_builtintopic_endpoint_t;
+                std::ffi::CStr::from_ptr((*e).topic_name).to_bytes() == topic.as_bytes()
+            })
+            .count();
+        cyclors::dds_return_loan(builtin_reader, samples.as_mut_ptr(), n);
+        count
+    }
+}
+
 /// TCP proxy from `listen_port` to `target_port` that can freeze the link without closing it,
 /// so that only the zenoh lease detects the loss (as with a stalled WiFi link).
 pub struct FreezableProxy {

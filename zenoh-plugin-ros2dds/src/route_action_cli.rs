@@ -191,8 +191,11 @@ impl RouteActionCli {
         self.liveliness_token = None;
     }
 
-    #[inline]
-    pub fn add_remote_route(&mut self, zenoh_id: &str, zenoh_key_expr_prefix: &keyexpr) {
+    pub fn add_remote_route(
+        &mut self,
+        zenoh_id: &str,
+        zenoh_key_expr_prefix: &keyexpr,
+    ) -> Result<(), String> {
         self.route_send_goal.add_remote_route(
             zenoh_id,
             &(zenoh_key_expr_prefix / *KE_SUFFIX_ACTION_SEND_GOAL),
@@ -208,14 +211,15 @@ impl RouteActionCli {
         self.route_feedback.add_remote_route(
             zenoh_id,
             &(zenoh_key_expr_prefix / *KE_SUFFIX_ACTION_FEEDBACK),
-        );
+        )?;
         self.route_status.add_remote_route(
             zenoh_id,
             &(zenoh_key_expr_prefix / *KE_SUFFIX_ACTION_STATUS),
-        );
+        )?;
         self.remote_routes
             .insert(format!("{zenoh_id}:{zenoh_key_expr_prefix}"));
         tracing::debug!("{self} now serving remote routes {:?}", self.remote_routes);
+        Ok(())
     }
 
     #[inline]

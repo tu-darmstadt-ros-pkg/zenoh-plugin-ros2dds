@@ -46,8 +46,7 @@ use crate::{
     liveliness_mgt::{new_ke_liveliness_sub, qos_to_key_expr},
     qos::{History, HistoryKind, Qos},
     qos_helpers::{
-        is_transient_local, route_qos_summary, same_route_qos, writer_qos_for_remote_writers,
-        writers_qos_for_remote_writers,
+        is_transient_local, route_qos_summary, same_route_qos, writers_qos_for_remote_writers,
     },
     ros2_utils::{is_message_for_action, ros2_message_type_to_dds_type},
     ros_discovery::RosDiscoveryInfoMgr,
@@ -87,7 +86,7 @@ pub struct RouteSubscriber {
     // `None` when route is created on a remote announcement and no local ROS2 Subscriber discovered yet
     #[serde(rename = "is_active", serialize_with = "serialize_option_as_bool")]
     zenoh_subscriber: Option<ZSubscriber>,
-    // QoS used when announcing the route on matched-reader activation
+    // QoS announced on matched-reader activation, also the Writer QoS of fixed routes
     #[serde(skip)]
     announce_qos: Qos,
     // the local DDS Writer re-publishing what comes from zenoh, NULL until needed, swapped on rebuild
@@ -166,7 +165,7 @@ impl fmt::Display for RouteSubscriber {
 }
 
 impl RouteSubscriber {
-    /// Route with a fixed Writer QoS, created immediately (action routes).
+    /// Route with a fixed Writer QoS (action routes), its Writer exists while a remote route is served.
     #[allow(clippy::too_many_arguments)]
     pub async fn create(
         ros2_name: String,
@@ -186,17 +185,15 @@ impl RouteSubscriber {
             // Thus just use default value.
             writer_qos.reliability = None;
         }
-        let mut route = Self::new(
+        Ok(Self::new(
             ros2_name,
             ros2_type,
             zenoh_key_expr,
             keyless,
-            writer_qos.clone(),
+            writer_qos,
             true,
             context,
-        );
-        route.install_writer(writer_qos)?;
-        Ok(route)
+        ))
     }
 
     /// Topic route whose Writer QoS follows the announced remote publishers.
@@ -346,20 +343,34 @@ impl RouteSubscriber {
         Ok(())
     }
 
-    /// Creates or rebuilds the Writer for the announced remote publishers.
-    /// Without any, a TRANSIENT_LOCAL Writer becomes the VOLATILE fallback, as in DDS the history leaves with its publisher.
+    /// Deletes the route's Writers, the DDS readers matched with them leave with them.
+    fn remove_writers(&mut self) {
+        for writer in [&self.dds_writer, &self.dds_volatile_writer] {
+            let writer = writer.swap(DDS_ENTITY_NULL, Ordering::Relaxed);
+            if writer != DDS_ENTITY_NULL {
+                delete_route_writer(writer, &self.context.ros_discovery_mgr);
+            }
+        }
+        self.writer_qos = None;
+        self.volatile_writer_qos = None;
+        self.transient_local = false;
+        if self.local_nodes.remove(MATCHED_READERS_KEY) && self.local_nodes.is_empty() {
+            self.retire_route();
+        }
+    }
+
+    /// Creates, rebuilds or deletes the Writer for the announced remote publishers.
     pub async fn update_writer(&mut self) -> Result<(), String> {
         if self.fixed_qos {
             return Ok(());
         }
         if self.remote_writer_qos.is_empty() {
-            self.set_volatile_writer(None)?;
-            if self.transient_local {
-                self.install_writer(self.fallback_writer_qos())?;
-                if self.zenoh_subscriber.is_some() {
-                    self.undeclare_zenoh_subscriber();
-                    self.declare_zenoh_subscriber().await?;
-                }
+            let was_tl = self.transient_local;
+            self.remove_writers();
+            // a VOLATILE Writer of a later publisher must not fetch history
+            if was_tl && self.zenoh_subscriber.is_some() {
+                self.undeclare_zenoh_subscriber();
+                self.declare_zenoh_subscriber().await?;
             }
             return Ok(());
         }
@@ -474,22 +485,9 @@ impl RouteSubscriber {
         };
     }
 
-    /// VOLATILE Writer QoS for publishers that announce nothing (plain zenoh applications), type hash and depth from the local Reader.
-    fn fallback_writer_qos(&self) -> Qos {
-        let qos = Qos {
-            user_data: self.announce_qos.user_data.clone(),
-            history: self.announce_qos.history.clone(),
-            ..Default::default()
-        };
-        writer_qos_for_remote_writers(&[qos])
-    }
-
     // Announce the route over Zenoh via a LivelinessToken
     async fn announce_route(&mut self, discovered_reader_qos: &Qos) -> Result<(), String> {
         tracing::debug!("{self} activate");
-        if !self.fixed_qos && self.dds_writer.load(Ordering::Relaxed) == DDS_ENTITY_NULL {
-            self.install_writer(self.fallback_writer_qos())?;
-        }
         self.declare_zenoh_subscriber().await?;
 
         // if not for an Action (since actions declare their own liveliness)
@@ -528,11 +526,18 @@ impl RouteSubscriber {
     }
 
     /// Action routes: a remote route is served (the Writer QoS is fixed).
-    #[inline]
-    pub fn add_remote_route(&mut self, zenoh_id: &str, zenoh_key_expr: &keyexpr) {
+    pub fn add_remote_route(
+        &mut self,
+        zenoh_id: &str,
+        zenoh_key_expr: &keyexpr,
+    ) -> Result<(), String> {
         self.remote_routes
             .insert(format!("{zenoh_id}:{zenoh_key_expr}"));
         tracing::debug!("{self} now serving remote routes {:?}", self.remote_routes);
+        if self.dds_writer.load(Ordering::Relaxed) == DDS_ENTITY_NULL {
+            self.install_writer(self.announce_qos.clone())?;
+        }
+        Ok(())
     }
 
     /// Topic routes: a remote publisher route was announced with `writer_qos`.
@@ -556,6 +561,9 @@ impl RouteSubscriber {
         self.remote_routes
             .remove(&format!("{zenoh_id}:{zenoh_key_expr}"));
         tracing::debug!("{self} now serving remote routes {:?}", self.remote_routes);
+        if self.remote_routes.is_empty() {
+            self.remove_writers();
+        }
     }
 
     /// Topic routes: a remote publisher announcement was retired, callers then call `update_writer`.
@@ -574,7 +582,7 @@ impl RouteSubscriber {
     }
 
     /// Remove all remote_routes entries for a departed bridge (prefix "<zenoh_id>:").
-    /// Returns whether any entry was removed, callers then call `update_writer`.
+    /// Returns whether any entry was removed, callers of topic routes then call `update_writer`.
     #[inline]
     pub fn prune_remote_routes_with_prefix(&mut self, prefix: &str) -> bool {
         let before = self.remote_routes.len();
@@ -584,6 +592,9 @@ impl RouteSubscriber {
             return false;
         }
         tracing::debug!("{self} now serving remote routes {:?}", self.remote_routes);
+        if self.fixed_qos && self.remote_routes.is_empty() {
+            self.remove_writers();
+        }
         true
     }
 

@@ -30,6 +30,7 @@ mod zenoh_args;
 
 const ROS_ARG_START_FLAG: &str = "--ros-args";
 const ROS_ARG_END_FLAG: &str = "--";
+const CLOSE_TIMEOUT: Duration = Duration::from_secs(5);
 
 fn parse_args() -> (Option<f32>, Config) {
     // Split arguments between "ROS-defined" ones and the "user-defined" ones
@@ -77,6 +78,8 @@ async fn main() {
         zenoh_plugin_ros2dds::ROS2Plugin::PLUGIN_LONG_VERSION
     );
 
+    let mut stop_signals = StopSignals::install();
+
     let (watchdog_period, config) = parse_args();
     tracing::info!("Zenoh {config:?}");
 
@@ -111,7 +114,56 @@ async fn main() {
         std::process::exit(-1);
     }
 
-    futures::future::pending::<()>().await;
+    let exit_code = stop_signals.recv().await;
+    tracing::info!("Stop signal received, closing");
+    match tokio::time::timeout(CLOSE_TIMEOUT, runtime.close()).await {
+        Ok(Ok(())) => {}
+        Ok(Err(e)) => tracing::error!("Failed to close the Zenoh runtime: {e}"),
+        Err(_) => tracing::error!("The Zenoh runtime did not close within {CLOSE_TIMEOUT:?}"),
+    }
+    std::process::exit(exit_code);
+}
+
+/// The signals that stop the bridge, handled from the start.
+#[cfg(unix)]
+struct StopSignals {
+    interrupt: tokio::signal::unix::Signal,
+    terminate: tokio::signal::unix::Signal,
+}
+
+#[cfg(unix)]
+impl StopSignals {
+    /// A handler also overrides SIGINT ignored since start, as scripts pass it to background jobs.
+    fn install() -> Self {
+        use tokio::signal::unix::{signal, SignalKind};
+        StopSignals {
+            interrupt: signal(SignalKind::interrupt()).expect("install SIGINT handler"),
+            terminate: signal(SignalKind::terminate()).expect("install SIGTERM handler"),
+        }
+    }
+
+    /// Waits for a stop signal, returns the exit code of a process killed by it so that supervisors see why it stopped.
+    async fn recv(&mut self) -> i32 {
+        tokio::select! {
+            _ = self.interrupt.recv() => 130,
+            _ = self.terminate.recv() => 143,
+        }
+    }
+}
+
+#[cfg(windows)]
+struct StopSignals;
+
+#[cfg(windows)]
+impl StopSignals {
+    fn install() -> Self {
+        StopSignals
+    }
+
+    async fn recv(&mut self) -> i32 {
+        tokio::signal::ctrl_c().await.expect("listen for Ctrl+C");
+        130
+    }
 }
 
 fn run_watchdog(period: f32) {

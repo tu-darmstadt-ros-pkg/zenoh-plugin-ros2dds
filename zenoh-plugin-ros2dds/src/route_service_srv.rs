@@ -22,7 +22,6 @@ use std::{
     time::{Duration, Instant},
 };
 
-use cyclors::dds_entity_t;
 use serde::Serialize;
 use zenoh::{
     bytes::ZBytes,
@@ -40,8 +39,9 @@ use crate::{
     dds_types::{DDSRawSample, TypeInfo},
     dds_utils::{
         create_dds_reader, create_dds_writer, dds_write, delete_dds_entity, get_guid,
-        get_instance_handle, is_cdr_little_endian, serialize_entity_guid, CDR_HEADER_BE,
-        CDR_HEADER_LE,
+        get_instance_handle, is_cdr_little_endian, publication_matched_count,
+        serialize_atomic_entity_guid, AtomicDDSEntity, CDR_HEADER_BE, CDR_HEADER_LE,
+        DDS_ENTITY_NULL,
     },
     liveliness_mgt::new_ke_liveliness_service_srv,
     ros2_utils::{
@@ -65,18 +65,20 @@ pub struct RouteServiceSrv {
     #[serde(skip)]
     context: Context,
     // the zenoh queryable used to expose the service server in zenoh.
-    // `None` when route is created on a remote announcement and no local ROS2 Service Server discovered yet
+    // `None` unless both a local ROS2 Service Server and remote clients exist
     #[serde(rename = "is_active", serialize_with = "serialize_option_as_bool")]
     zenoh_queryable: Option<Queryable<()>>,
-    // the local DDS Writer sending requests to the service server
-    #[serde(serialize_with = "serialize_entity_guid")]
-    req_writer: dds_entity_t,
-    // the local DDS Reader receiving replies from the service server
-    #[serde(serialize_with = "serialize_entity_guid")]
-    rep_reader: dds_entity_t,
+    // the local DDS Writer sending requests to the service server, NULL without remote clients
+    #[serde(serialize_with = "serialize_atomic_entity_guid")]
+    req_writer: AtomicDDSEntity,
+    // the local DDS Reader receiving replies from the service server, NULL without remote clients
+    #[serde(serialize_with = "serialize_atomic_entity_guid")]
+    rep_reader: AtomicDDSEntity,
     // the client GUID used in each request
     #[serde(skip)]
     client_guid: u64,
+    #[serde(skip)]
+    type_info: Option<Arc<TypeInfo>>,
     // the ROS sequence number for requests
     #[serde(skip)]
     sequence_number: Arc<AtomicU64>,
@@ -94,23 +96,7 @@ pub struct RouteServiceSrv {
 
 impl Drop for RouteServiceSrv {
     fn drop(&mut self) {
-        // remove writer's GID from ros_discovery_info message
-        match get_guid(&self.req_writer) {
-            Ok(gid) => self.context.ros_discovery_mgr.remove_dds_writer(gid),
-            Err(e) => tracing::warn!("{self}: {e}"),
-        }
-        // remove reader's GID from ros_discovery_info message
-        match get_guid(&self.rep_reader) {
-            Ok(gid) => self.context.ros_discovery_mgr.remove_dds_reader(gid),
-            Err(e) => tracing::warn!("{self}: {e}"),
-        }
-
-        if let Err(e) = delete_dds_entity(self.req_writer) {
-            tracing::warn!("{}: error deleting DDS Writer:  {}", self, e);
-        }
-        if let Err(e) = delete_dds_entity(self.rep_reader) {
-            tracing::warn!("{}: error deleting DDS Reader:  {}", self, e);
-        }
+        self.deactivate();
     }
 }
 
@@ -125,6 +111,7 @@ impl fmt::Display for RouteServiceSrv {
 }
 
 impl RouteServiceSrv {
+    /// Its DDS endpoints exist while remote clients are served, its queryable while a local server exists too.
     #[allow(clippy::too_many_arguments)]
     pub async fn create(
         ros2_name: String,
@@ -133,8 +120,32 @@ impl RouteServiceSrv {
         type_info: &Option<Arc<TypeInfo>>,
         context: Context,
     ) -> Result<RouteServiceSrv, String> {
-        let route_id = format!("Route Service Server (ROS:{ros2_name} <-> Zenoh:{zenoh_key_expr})");
-        tracing::debug!("{route_id}: creation with type {ros2_type}");
+        tracing::debug!(
+            "Route Service Server (ROS:{ros2_name} <-> Zenoh:{zenoh_key_expr}): creation with type {ros2_type}"
+        );
+        Ok(RouteServiceSrv {
+            ros2_name,
+            ros2_type,
+            zenoh_key_expr,
+            context,
+            zenoh_queryable: None,
+            req_writer: AtomicDDSEntity::new(DDS_ENTITY_NULL),
+            rep_reader: AtomicDDSEntity::new(DDS_ENTITY_NULL),
+            client_guid: 0,
+            type_info: type_info.clone(),
+            sequence_number: Arc::new(AtomicU64::default()),
+            queries_in_progress: Arc::new(RwLock::new(HashMap::new())),
+            liveliness_token: None,
+            remote_routes: HashSet::new(),
+            local_nodes: HashSet::new(),
+        })
+    }
+
+    /// Creates the DDS Writer (requests) and Reader (replies) standing in for the remote clients.
+    fn activate(&mut self) -> Result<(), String> {
+        let route_id = self.to_string();
+        let ros2_name = &self.ros2_name;
+        let context = &self.context;
 
         // Default Service QoS
         let mut qos = QOS_DEFAULT_SERVICE.clone();
@@ -150,7 +161,7 @@ impl RouteServiceSrv {
         // transient BAD_PARAMETER under participant churn) so we never leak an
         // entity or build a half-created route.
         let req_topic_name = format!("rq{ros2_name}Request");
-        let req_type_name = ros2_service_type_to_request_dds_type(&ros2_type);
+        let req_type_name = ros2_service_type_to_request_dds_type(&self.ros2_type);
         let req_writer = create_dds_writer(
             context.participant,
             req_topic_name,
@@ -181,25 +192,21 @@ impl RouteServiceSrv {
             qos.user_data.as_ref().unwrap()
         );
 
-        // map of queries in progress
-        let queries_in_progress: Arc<RwLock<HashMap<CddsRequestHeader, (Query, Instant)>>> =
-            Arc::new(RwLock::new(HashMap::new()));
-
         // create DDS Reader to receive replies and route them to Zenoh
         let rep_topic_name = format!("rr{ros2_name}Reply");
-        let rep_type_name = ros2_service_type_to_reply_dds_type(&ros2_type);
+        let rep_type_name = ros2_service_type_to_reply_dds_type(&self.ros2_type);
         let rep_reader = match create_dds_reader(
             context.participant,
             rep_topic_name,
             rep_type_name,
-            type_info,
+            &self.type_info,
             true,
             qos,
             None,
             false,
             {
-                let queries_in_progress = queries_in_progress.clone();
-                let zenoh_key_expr = zenoh_key_expr.clone();
+                let queries_in_progress = self.queries_in_progress.clone();
+                let zenoh_key_expr = self.zenoh_key_expr.clone();
                 move |sample| {
                     route_dds_reply_to_zenoh(
                         sample,
@@ -230,25 +237,50 @@ impl RouteServiceSrv {
         context.ros_discovery_mgr.add_dds_writer(writer_gid);
         context.ros_discovery_mgr.add_dds_reader(reader_gid);
 
-        Ok(RouteServiceSrv {
-            ros2_name,
-            ros2_type,
-            zenoh_key_expr,
-            context,
-            zenoh_queryable: None,
-            req_writer,
-            rep_reader,
-            client_guid,
-            sequence_number: Arc::new(AtomicU64::default()),
-            queries_in_progress,
-            liveliness_token: None,
-            remote_routes: HashSet::new(),
-            local_nodes: HashSet::new(),
-        })
+        self.req_writer.store(req_writer, Ordering::Relaxed);
+        self.rep_reader.store(rep_reader, Ordering::Relaxed);
+        self.client_guid = client_guid;
+        Ok(())
     }
 
-    // Announce the route over Zenoh via a LivelinessToken
-    async fn announce_route(&mut self) -> Result<(), String> {
+    /// Deletes the queryable and the DDS endpoints standing in for the remote clients.
+    fn deactivate(&mut self) {
+        self.zenoh_queryable = None;
+        let req_writer = self.req_writer.swap(DDS_ENTITY_NULL, Ordering::Relaxed);
+        if req_writer != DDS_ENTITY_NULL {
+            match get_guid(&req_writer) {
+                Ok(gid) => self.context.ros_discovery_mgr.remove_dds_writer(gid),
+                Err(e) => tracing::warn!("{self}: {e}"),
+            }
+            if let Err(e) = delete_dds_entity(req_writer) {
+                tracing::warn!("{self}: error deleting DDS Writer: {e}");
+            }
+        }
+        let rep_reader = self.rep_reader.swap(DDS_ENTITY_NULL, Ordering::Relaxed);
+        if rep_reader != DDS_ENTITY_NULL {
+            match get_guid(&rep_reader) {
+                Ok(gid) => self.context.ros_discovery_mgr.remove_dds_reader(gid),
+                Err(e) => tracing::warn!("{self}: {e}"),
+            }
+            if let Err(e) = delete_dds_entity(rep_reader) {
+                tracing::warn!("{self}: error deleting DDS Reader: {e}");
+            }
+        }
+        // their clients are gone, dropping the queries finalizes them
+        zwrite!(self.queries_in_progress).clear();
+    }
+
+    /// Exposes the service in zenoh while it has both a local server and remote clients.
+    async fn update_queryable(&mut self) -> Result<(), String> {
+        let req_writer = self.req_writer.load(Ordering::Relaxed);
+        if self.local_nodes.is_empty() || req_writer == DDS_ENTITY_NULL {
+            self.zenoh_queryable = None;
+            return Ok(());
+        }
+        if self.zenoh_queryable.is_some() {
+            return Ok(());
+        }
+
         // For lifetime issue, redeclare the zenoh key expression that can't be stored in Self
         let declared_ke = self
             .context
@@ -257,14 +289,11 @@ impl RouteServiceSrv {
             .await
             .map_err(|e| format!("{self}: failed to declare KeyExpr: {e}"))?;
 
-        // create the zenoh Queryable
-        // if Reader is TRANSIENT_LOCAL, use a PublicationCache to store historical data
         let queries_in_progress: Arc<RwLock<HashMap<CddsRequestHeader, (Query, Instant)>>> =
             self.queries_in_progress.clone();
         let sequence_number: Arc<AtomicU64> = self.sequence_number.clone();
         let route_id: String = self.to_string();
         let client_guid = self.client_guid;
-        let req_writer: i32 = self.req_writer;
         self.zenoh_queryable = Some(
             self.context
                 .zsession
@@ -287,6 +316,12 @@ impl RouteServiceSrv {
                     )
                 })?,
         );
+        Ok(())
+    }
+
+    // Announce the route over Zenoh via a LivelinessToken
+    async fn announce_route(&mut self) -> Result<(), String> {
+        self.update_queryable().await?;
 
         // if not for an Action (since actions declare their own liveliness)
         if !is_service_for_action(&self.ros2_name) {
@@ -315,17 +350,24 @@ impl RouteServiceSrv {
     // Retire the route over Zenoh removing the LivelinessToken
     fn retire_route(&mut self) {
         tracing::debug!("{self} retire");
-        // Drop Zenoh Publisher and Liveliness token
-        // The DDS Writer remains to be discovered by local ROS nodes
+        // Drop Zenoh Queryable and Liveliness token
+        // The DDS endpoints remain to be discovered by local ROS nodes
         self.zenoh_queryable = None;
         self.liveliness_token = None;
     }
 
-    #[inline]
-    pub fn add_remote_route(&mut self, zenoh_id: &str, zenoh_key_expr: &keyexpr) {
+    pub async fn add_remote_route(
+        &mut self,
+        zenoh_id: &str,
+        zenoh_key_expr: &keyexpr,
+    ) -> Result<(), String> {
         self.remote_routes
             .insert(format!("{zenoh_id}:{zenoh_key_expr}"));
         tracing::debug!("{self} now serving remote routes {:?}", self.remote_routes);
+        if self.req_writer.load(Ordering::Relaxed) == DDS_ENTITY_NULL {
+            self.activate()?;
+        }
+        self.update_queryable().await
     }
 
     #[inline]
@@ -333,10 +375,14 @@ impl RouteServiceSrv {
         self.remote_routes
             .remove(&format!("{zenoh_id}:{zenoh_key_expr}"));
         tracing::debug!("{self} now serving remote routes {:?}", self.remote_routes);
+        if self.remote_routes.is_empty() {
+            self.deactivate();
+        }
     }
 
     /// Remove all remote_routes entries for a departed bridge (prefix
-    /// "<zenoh_id>:"). Returns whether any entry was removed.
+    /// "<zenoh_id>:"), deactivating the DDS entities if this leaves the route
+    /// serving no remote route. Returns whether any entry was removed.
     #[inline]
     pub fn prune_remote_routes_with_prefix(&mut self, prefix: &str) -> bool {
         let before = self.remote_routes.len();
@@ -345,6 +391,9 @@ impl RouteServiceSrv {
             return false;
         }
         tracing::debug!("{self} now serving remote routes {:?}", self.remote_routes);
+        if self.remote_routes.is_empty() {
+            self.deactivate();
+        }
         true
     }
 
@@ -402,6 +451,18 @@ fn route_zenoh_request_to_dds(
     client_guid: u64,
     req_writer: i32,
 ) {
+    // a VOLATILE request written before the server matched the fresh Writer would be lost silently
+    if publication_matched_count(req_writer) == Some(0) {
+        tracing::warn!("{route_id}: no local service server matched yet, rejecting request");
+        if let Err(e) = query
+            .reply_err("service server not matched by the bridge yet")
+            .wait()
+        {
+            tracing::warn!("{route_id}: replying the rejection failed: {e}");
+        }
+        return;
+    }
+
     // Get expected endianness from the query value:
     // if any and if long enoough it shall be the Request type encoded as CDR (including 4 bytes header)
     let is_little_endian = match query.payload() {
