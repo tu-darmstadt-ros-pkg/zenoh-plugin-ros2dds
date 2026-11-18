@@ -177,29 +177,20 @@ impl RouteActionSrv {
         self.liveliness_token = None;
     }
 
-    pub async fn add_remote_route(
-        &mut self,
-        zenoh_id: &str,
-        zenoh_key_expr_prefix: &keyexpr,
-    ) -> Result<(), String> {
-        self.route_send_goal
-            .add_remote_route(
-                zenoh_id,
-                &(zenoh_key_expr_prefix / *KE_SUFFIX_ACTION_SEND_GOAL),
-            )
-            .await?;
-        self.route_cancel_goal
-            .add_remote_route(
-                zenoh_id,
-                &(zenoh_key_expr_prefix / *KE_SUFFIX_ACTION_CANCEL_GOAL),
-            )
-            .await?;
-        self.route_get_result
-            .add_remote_route(
-                zenoh_id,
-                &(zenoh_key_expr_prefix / *KE_SUFFIX_ACTION_GET_RESULT),
-            )
-            .await?;
+    #[inline]
+    pub fn add_remote_route(&mut self, zenoh_id: &str, zenoh_key_expr_prefix: &keyexpr) {
+        self.route_send_goal.add_remote_route(
+            zenoh_id,
+            &(zenoh_key_expr_prefix / *KE_SUFFIX_ACTION_SEND_GOAL),
+        );
+        self.route_cancel_goal.add_remote_route(
+            zenoh_id,
+            &(zenoh_key_expr_prefix / *KE_SUFFIX_ACTION_CANCEL_GOAL),
+        );
+        self.route_get_result.add_remote_route(
+            zenoh_id,
+            &(zenoh_key_expr_prefix / *KE_SUFFIX_ACTION_GET_RESULT),
+        );
         self.route_feedback.add_remote_route(
             zenoh_id,
             &(zenoh_key_expr_prefix / *KE_SUFFIX_ACTION_FEEDBACK),
@@ -211,7 +202,6 @@ impl RouteActionSrv {
         self.remote_routes
             .insert(format!("{zenoh_id}:{zenoh_key_expr_prefix}"));
         tracing::debug!("{self} now serving remote routes {:?}", self.remote_routes);
-        Ok(())
     }
 
     #[inline]
