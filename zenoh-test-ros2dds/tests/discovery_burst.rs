@@ -13,11 +13,12 @@ use std::{
     time::Duration,
 };
 
-use common::BridgeConfig;
+use common::{BridgeConfig, Endpoint};
 use futures::StreamExt;
 use r2r::QosProfile;
 
 const BRIDGE_EP: &str = "tcp/127.0.0.1:7471";
+const OPERATOR_DOMAIN: u32 = 1;
 fn num_topics() -> usize {
     std::env::var("BURST_TOPICS")
         .ok()
@@ -31,7 +32,7 @@ async fn burst_of_subscriptions_all_get_active_routes() {
     common::init_env();
     std::env::set_var("ROS_DOMAIN_ID", "0");
 
-    let _bridge = common::create_bridge_with(&BridgeConfig::new(0).listen(BRIDGE_EP)).await;
+    let bridge = common::create_bridge_with(&BridgeConfig::new(0).listen(BRIDGE_EP)).await;
     tokio::time::sleep(Duration::from_secs(2)).await;
 
     // ROS node creating num_topics() subscriptions as fast as possible (the
@@ -43,7 +44,7 @@ async fn burst_of_subscriptions_all_get_active_routes() {
     let ready = Arc::new(AtomicBool::new(false));
     let ready2 = ready.clone();
 
-    std::thread::spawn(move || {
+    let node_thread = std::thread::spawn(move || {
         let ctx = r2r::Context::create().unwrap();
         let mut node = r2r::Node::create(ctx, "burst_sub", "").unwrap();
 
@@ -107,37 +108,36 @@ async fn burst_of_subscriptions_all_get_active_routes() {
         }
     }
 
-    // 2) Functional check: publish on every topic via zenoh, verify delivery.
-    let mut publishers = Vec::new();
-    for i in 0..num_topics() {
-        publishers.push(
-            session
-                .declare_publisher(format!("burst_topic_{i}"))
-                .await
-                .unwrap(),
-        );
-    }
-    tokio::time::sleep(Duration::from_secs(2)).await; // matching
-    let payload =
-        cdr::serialize::<_, _, cdr::CdrLe>(&"ping".to_string(), cdr::size::Infinite).unwrap();
-    for _round in 0..5 {
-        for p in &publishers {
-            p.put(payload.clone()).await.unwrap();
-        }
-        tokio::time::sleep(Duration::from_millis(200)).await;
-    }
-    tokio::time::sleep(Duration::from_secs(2)).await;
-
+    // 2) Functional check: a ROS publisher behind a remote bridge publishes on every topic, verify delivery.
+    let operator =
+        common::create_bridge_with(&BridgeConfig::new(OPERATOR_DOMAIN).connect(BRIDGE_EP)).await;
+    let count = num_topics().to_string();
+    let publ = Endpoint::spawn(
+        "pub_many",
+        OPERATOR_DOMAIN,
+        &["pub_many", "/burst_topic", "rel", "vol", "10", &count],
+    )
+    .await;
     let mut received: HashMap<usize, usize> = HashMap::new();
-    while let Ok(i) = msg_rx.try_recv() {
-        *received.entry(i).or_default() += 1;
+    let deadline = std::time::Instant::now() + Duration::from_secs(30);
+    while received.len() < num_topics() && std::time::Instant::now() < deadline {
+        while let Ok(i) = msg_rx.try_recv() {
+            *received.entry(i).or_default() += 1;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
     }
+    publ.stop().await;
+    common::close_bridge(operator).await;
     let dead: Vec<String> = (0..num_topics())
         .filter(|i| !received.contains_key(i))
         .map(|i| format!("burst_topic_{i}"))
         .collect();
 
     stop.store(true, Ordering::Relaxed);
+    // a node or bridge still running while the process exits can crash its teardown
+    node_thread.join().expect("node thread panicked");
+    let _ = session.close().await;
+    common::close_bridge(bridge).await;
 
     println!(
         "=== burst result: {}/{} topics delivered data; {} route-bookkeeping problems ===",

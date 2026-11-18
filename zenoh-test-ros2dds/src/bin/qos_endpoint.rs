@@ -4,9 +4,12 @@
 //!
 //! pub publishes `<tag>:h0..h4` at once and then `<tag>:l<i>` at 10 Hz.
 //! lazy_pub publishes `<tag>:l<i>` at 10 Hz while it has a matched subscription.
+//! pub_many publishes `p:l<i>` at 5 Hz on `<topic>_0..<tag>`.
 //! pub_pair creates one publisher, a second one in the same node on the stdin line `ADD` and deletes it on `DROP`.
 //! sub and tf_sub count std_msgs/String messages or tf child frames.
 //! tf_pub publishes one tf2_msgs/TFMessage with child frame `<tag>`, tf_stream republishes it at 50 Hz.
+//! server serves AddTwoInts as `<topic>`, action_server serves Fibonacci goals with feedback 0,1,1,2,3 and result 0,1,1,2,3,5.
+//! client and action_client only hold an AddTwoInts client or a Fibonacci action client named `<topic>`.
 //!
 //! Prints `READY` once its entities exist, subscribers then print a cumulative `RESULT ...` line every 200 ms.
 //! Runs until stdin closes, which also happens when the test dies, and then deletes its entities so DDS peers see it leave.
@@ -157,6 +160,29 @@ fn main() {
                 i += 1;
             }
         }
+        "pub_many" => {
+            let count: usize = tag.parse().expect("pub_many needs the topic count as tag");
+            let publishers: Vec<_> = (0..count)
+                .map(|k| {
+                    node.create_publisher::<r2r::std_msgs::msg::String>(
+                        &format!("{topic}_{k}"),
+                        profile.clone(),
+                    )
+                    .expect("create publisher")
+                })
+                .collect();
+            say("READY");
+            let mut i = 0u64;
+            while !stopping() {
+                std::thread::sleep(Duration::from_millis(200));
+                for p in &publishers {
+                    let data = format!("p:l{i}");
+                    p.publish(&r2r::std_msgs::msg::String { data })
+                        .expect("publish");
+                }
+                i += 1;
+            }
+        }
         "pub_pair" => {
             let _first = node
                 .create_publisher::<r2r::std_msgs::msg::String>(topic, profile.clone())
@@ -240,7 +266,73 @@ fn main() {
                 },
             );
         }
+        "server" => {
+            let mut service = node
+                .create_service::<r2r::example_interfaces::srv::AddTwoInts::Service>(topic, profile)
+                .expect("create service");
+            say("READY");
+            while !stopping() {
+                node.spin_once(Duration::from_millis(10));
+                while let Some(Some(req)) = service.next().now_or_never() {
+                    let sum = req.message.a + req.message.b;
+                    req.respond(r2r::example_interfaces::srv::AddTwoInts::Response { sum })
+                        .expect("respond");
+                }
+            }
+        }
+        "action_server" => {
+            use r2r::example_interfaces::action::Fibonacci;
+            let mut server = node
+                .create_action_server::<Fibonacci::Action>(topic)
+                .expect("create action server");
+            // goals get their feedback and result later so that the client's subscriptions settle
+            let mut goals = Vec::new();
+            say("READY");
+            while !stopping() {
+                node.spin_once(Duration::from_millis(10));
+                while let Some(Some(req)) = server.next().now_or_never() {
+                    let (goal, _cancel) = req.accept().expect("accept goal");
+                    goals.push((goal, Instant::now(), false));
+                }
+                for (goal, accepted, fed) in goals.iter_mut() {
+                    if !*fed && accepted.elapsed() >= Duration::from_millis(300) {
+                        let sequence = vec![0, 1, 1, 2, 3];
+                        goal.publish_feedback(Fibonacci::Feedback { sequence })
+                            .expect("publish feedback");
+                        *fed = true;
+                    }
+                }
+                goals.retain_mut(|(goal, accepted, _)| {
+                    if accepted.elapsed() < Duration::from_millis(600) {
+                        return true;
+                    }
+                    let sequence = vec![0, 1, 1, 2, 3, 5];
+                    goal.succeed(Fibonacci::Result { sequence })
+                        .expect("succeed goal");
+                    false
+                });
+            }
+        }
+        "client" => {
+            let _client = node
+                .create_client::<r2r::example_interfaces::srv::AddTwoInts::Service>(topic, profile)
+                .expect("create client");
+            hold(&mut node);
+        }
+        "action_client" => {
+            let _client = node
+                .create_action_client::<r2r::example_interfaces::action::Fibonacci::Action>(topic)
+                .expect("create action client");
+            hold(&mut node);
+        }
         other => panic!("unknown role {other}"),
+    }
+}
+
+fn hold(node: &mut r2r::Node) {
+    say("READY");
+    while !stopping() {
+        node.spin_once(Duration::from_millis(10));
     }
 }
 

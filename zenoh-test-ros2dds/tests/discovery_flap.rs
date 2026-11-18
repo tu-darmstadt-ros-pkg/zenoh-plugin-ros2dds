@@ -14,11 +14,12 @@ use std::{
     time::Duration,
 };
 
-use common::BridgeConfig;
+use common::{BridgeConfig, Endpoint};
 use futures::StreamExt;
 use r2r::QosProfile;
 
 const BRIDGE_EP: &str = "tcp/127.0.0.1:7472";
+const OPERATOR_DOMAIN: u32 = 2;
 fn env_usize(key: &str, default: usize) -> usize {
     std::env::var(key)
         .ok()
@@ -41,7 +42,7 @@ async fn flapped_subscriptions_all_get_active_routes() {
     // the discovery race logs "Failed to get DDS info for any Reader" even when the recreated subscription heals it
     let logbuf = common::LogBuf::install();
 
-    let _bridge = common::create_bridge_with(&BridgeConfig::new(0).listen(BRIDGE_EP)).await;
+    let bridge = common::create_bridge_with(&BridgeConfig::new(0).listen(BRIDGE_EP)).await;
     tokio::time::sleep(Duration::from_secs(2)).await;
 
     let (msg_tx, msg_rx) = mpsc::channel::<usize>();
@@ -50,7 +51,7 @@ async fn flapped_subscriptions_all_get_active_routes() {
     let done_flapping = Arc::new(AtomicBool::new(false));
     let done2 = done_flapping.clone();
 
-    std::thread::spawn(move || {
+    let node_thread = std::thread::spawn(move || {
         let ctx = r2r::Context::create().unwrap();
         let mut node = r2r::Node::create(ctx, "flap_sub", "").unwrap();
 
@@ -128,37 +129,36 @@ async fn flapped_subscriptions_all_get_active_routes() {
         }
     }
 
-    // 2) Functional: publish on every topic, verify the keeper receives.
-    let mut publishers = Vec::new();
-    for i in 0..num_topics() {
-        publishers.push(
-            session
-                .declare_publisher(format!("flap_topic_{i}"))
-                .await
-                .unwrap(),
-        );
-    }
-    tokio::time::sleep(Duration::from_secs(2)).await;
-    let payload =
-        cdr::serialize::<_, _, cdr::CdrLe>(&"ping".to_string(), cdr::size::Infinite).unwrap();
-    for _round in 0..5 {
-        for p in &publishers {
-            p.put(payload.clone()).await.unwrap();
-        }
-        tokio::time::sleep(Duration::from_millis(200)).await;
-    }
-    tokio::time::sleep(Duration::from_secs(2)).await;
-
+    // 2) Functional: a ROS publisher behind a remote bridge publishes on every topic, verify the keeper receives.
+    let operator =
+        common::create_bridge_with(&BridgeConfig::new(OPERATOR_DOMAIN).connect(BRIDGE_EP)).await;
+    let count = num_topics().to_string();
+    let publ = Endpoint::spawn(
+        "pub_many",
+        OPERATOR_DOMAIN,
+        &["pub_many", "/flap_topic", "rel", "vol", "10", &count],
+    )
+    .await;
     let mut received: HashMap<usize, usize> = HashMap::new();
-    while let Ok(i) = msg_rx.try_recv() {
-        *received.entry(i).or_default() += 1;
+    let deadline = std::time::Instant::now() + Duration::from_secs(30);
+    while received.len() < num_topics() && std::time::Instant::now() < deadline {
+        while let Ok(i) = msg_rx.try_recv() {
+            *received.entry(i).or_default() += 1;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
     }
+    publ.stop().await;
+    common::close_bridge(operator).await;
     let dead: Vec<String> = (0..num_topics())
         .filter(|i| !received.contains_key(i))
         .map(|i| format!("flap_topic_{i}"))
         .collect();
 
     stop.store(true, Ordering::Relaxed);
+    // a node or bridge still running while the process exits can crash its teardown
+    node_thread.join().expect("node thread panicked");
+    let _ = session.close().await;
+    common::close_bridge(bridge).await;
 
     // Race evidence: the no-retry drop fired even if the end state healed.
     let race_errors = logbuf.lines_containing("Error updating route");

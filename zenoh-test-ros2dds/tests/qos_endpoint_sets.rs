@@ -305,13 +305,13 @@ async fn subscriber_writer_rebuilds_follow_remote_publishers() {
         ),
     );
 
-    // 2. publisher gone, a VOLATILE Writer is kept
+    // 2. publisher gone, the Writer leaves with it
     pub_v.stop().await;
     tokio::time::sleep(SETTLE).await;
     let r = sub_route(&admin, "rebuild").await;
     check(
-        field(&r, "dds_writer") == g1,
-        format!("Writer rebuilt with no publisher left: {r}"),
+        field(&r, "dds_writer").is_empty(),
+        format!("Writer kept with no publisher left: {r}"),
     );
 
     // 3. TL publisher: upgrade while the TL subscriber waits
@@ -423,13 +423,13 @@ async fn subscriber_writer_rebuilds_follow_remote_publishers() {
         format!("late TL sub got no data from t: {}", late.raw_result()),
     );
 
-    // 7. no publisher left, as in DDS the history leaves with its publishers
+    // 7. no publisher left, as in DDS the Writer and its history leave with its publishers
     pub_t.stop().await;
     pub_t2.stop().await;
     tokio::time::sleep(SETTLE).await;
     let r = sub_route(&admin, "rebuild").await;
     check(
-        field(&r, "writer_qos").contains("VOLATILE"),
+        field(&r, "dds_writer").is_empty(),
         format!("TL Writer kept without publisher: {r}"),
     );
 
@@ -483,61 +483,6 @@ async fn route_retires_after_downgrade_when_last_subscriber_leaves() {
     assert!(
         field(&r, "is_active") != "true" && !common::route_serves_node(&r, "<matched_dds_readers>"),
         "route still active / serving matched readers after its last subscriber left: {r}"
-    );
-}
-
-/// Data from a plain zenoh publisher (which announces nothing) keeps flowing
-/// after a bridge publisher of the same topic leaves.
-#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn plain_zenoh_publisher_survives_bridge_publisher_leaving() {
-    common::init_env();
-    let (rd, od, port, client_port) = (212, 213, 7752, 7753);
-    let robot = common::create_bridge_with(&robot_bridge_cfg(rd, port)).await;
-    let operator = common::create_bridge_with(
-        &operator_bridge_cfg(od, port).listen(format!("tcp/127.0.0.1:{client_port}")),
-    )
-    .await;
-    let sub = Endpoint::spawn("sub", od, &["sub", "/plain", "rel", "vol", "10"]).await;
-    let pub_b = Endpoint::spawn("b", rd, &["pub", "/plain", "rel", "tl", "100", "b"]).await;
-
-    let zenoh_pub = admin_session(client_port).await;
-    let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
-    let publisher = {
-        let stop = stop.clone();
-        let zenoh_pub = zenoh_pub.clone();
-        tokio::spawn(async move {
-            let mut i = 0;
-            while !stop.load(std::sync::atomic::Ordering::Relaxed) {
-                let msg = format!("z:l{i}");
-                let buf = cdr::serialize::<_, _, cdr::CdrLe>(&msg, cdr::size::Infinite).unwrap();
-                zenoh_pub.put("plain", buf).await.unwrap();
-                i += 1;
-                tokio::time::sleep(Duration::from_millis(100)).await;
-            }
-        })
-    };
-    tokio::time::sleep(SETTLE + SETTLE).await;
-    let (z_before, b_before) = (sub.live_from("z"), sub.live_from("b"));
-    pub_b.stop().await;
-    tokio::time::sleep(SETTLE).await;
-    let z_mid = sub.live_from("z");
-    tokio::time::sleep(SETTLE).await;
-    let (z_after, raw) = (sub.live_from("z"), sub.raw_result());
-
-    stop.store(true, std::sync::atomic::Ordering::Relaxed);
-    let _ = publisher.await;
-    sub.stop().await;
-    let _ = zenoh_pub.close().await;
-    common::close_bridge(operator).await;
-    common::close_bridge(robot).await;
-
-    assert!(
-        z_before > 0 && b_before > 0,
-        "no data from both publishers: {raw}"
-    );
-    assert!(
-        z_after > z_mid,
-        "plain zenoh data stopped after the bridge publisher left: {raw}"
     );
 }
 

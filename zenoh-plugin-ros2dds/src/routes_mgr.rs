@@ -407,14 +407,15 @@ impl RoutesMgr {
                 if let Entry::Occupied(mut entry) = self.routes_subscribers.entry(ros2_name) {
                     let route = entry.get_mut();
                     route.remove_remote_publisher(&zenoh_id, &zenoh_key_expr, keyless, &writer_qos);
+                    // deleting the Writer can leave the route without its matched readers
+                    let updated = route.update_writer().await;
                     if route.is_unused() {
                         self.admin_space
                             .remove(&(*KE_PREFIX_ROUTE_SUBSCRIBER / &zenoh_key_expr));
                         let route = entry.remove();
                         tracing::info!("{route} removed");
-                    } else {
-                        route.update_writer().await?;
                     }
+                    updated?;
                 }
             }
 
@@ -516,7 +517,7 @@ impl RoutesMgr {
                         true,
                     )
                     .await?;
-                route.add_remote_route(&zenoh_id, &zenoh_key_expr);
+                route.add_remote_route(&zenoh_id, &zenoh_key_expr).await?;
             }
 
             RetiredServiceCli {
@@ -551,7 +552,7 @@ impl RoutesMgr {
                         ros2_type,
                     )
                     .await?;
-                route.add_remote_route(&zenoh_id, &zenoh_key_expr);
+                route.add_remote_route(&zenoh_id, &zenoh_key_expr)?;
             }
 
             RetiredActionSrv {
@@ -588,7 +589,7 @@ impl RoutesMgr {
                         ros2_type,
                     )
                     .await?;
-                route.add_remote_route(&zenoh_id, &zenoh_key_expr);
+                route.add_remote_route(&zenoh_id, &zenoh_key_expr).await?;
             }
 
             RetiredActionCli {
@@ -634,6 +635,17 @@ impl RoutesMgr {
                 tracing::warn!("{route}: failed to adapt DDS Writer to remaining publishers: {e}");
             }
         }
+        // deleting a Writer can leave a route without its matched readers
+        self.routes_subscribers.retain(|ros2_name, route| {
+            if !route.is_unused() {
+                return true;
+            }
+            let zenoh_key_expr = ros2_name_to_key_expr(ros2_name, &self.context.config);
+            self.admin_space
+                .remove(&(*KE_PREFIX_ROUTE_SUBSCRIBER / &zenoh_key_expr));
+            tracing::info!("{route} removed");
+            false
+        });
     }
 
     /// A remote bridge's zenoh transport was lost (its session dropped). On an
