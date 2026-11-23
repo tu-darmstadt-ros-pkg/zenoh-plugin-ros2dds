@@ -9,7 +9,6 @@
 //! sub and tf_sub count std_msgs/String messages or tf child frames.
 //! tf_pub publishes one tf2_msgs/TFMessage with child frame `<tag>`, tf_stream republishes it at 50 Hz.
 //! server serves AddTwoInts as `<topic>`, action_server serves Fibonacci goals with feedback 0,1,1,2,3 and result 0,1,1,2,3,5.
-//! client and action_client only hold an AddTwoInts client or a Fibonacci action client named `<topic>`.
 //!
 //! Prints `READY` once its entities exist, subscribers then print a cumulative `RESULT ...` line every 200 ms.
 //! Runs until stdin closes, which also happens when the test dies, and then deletes its entities so DDS peers see it leave.
@@ -313,26 +312,7 @@ fn main() {
                 });
             }
         }
-        "client" => {
-            let _client = node
-                .create_client::<r2r::example_interfaces::srv::AddTwoInts::Service>(topic, profile)
-                .expect("create client");
-            hold(&mut node);
-        }
-        "action_client" => {
-            let _client = node
-                .create_action_client::<r2r::example_interfaces::action::Fibonacci::Action>(topic)
-                .expect("create action client");
-            hold(&mut node);
-        }
         other => panic!("unknown role {other}"),
-    }
-}
-
-fn hold(node: &mut r2r::Node) {
-    say("READY");
-    while !stopping() {
-        node.spin_once(Duration::from_millis(10));
     }
 }
 

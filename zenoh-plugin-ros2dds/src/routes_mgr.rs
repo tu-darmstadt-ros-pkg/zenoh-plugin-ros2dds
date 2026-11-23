@@ -517,7 +517,7 @@ impl RoutesMgr {
                         true,
                     )
                     .await?;
-                route.add_remote_route(&zenoh_id, &zenoh_key_expr).await?;
+                route.add_remote_route(&zenoh_id, &zenoh_key_expr);
             }
 
             RetiredServiceCli {
@@ -589,7 +589,7 @@ impl RoutesMgr {
                         ros2_type,
                     )
                     .await?;
-                route.add_remote_route(&zenoh_id, &zenoh_key_expr).await?;
+                route.add_remote_route(&zenoh_id, &zenoh_key_expr);
             }
 
             RetiredActionCli {

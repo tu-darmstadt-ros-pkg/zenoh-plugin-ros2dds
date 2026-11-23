@@ -1,5 +1,6 @@
 //
 // The DDS endpoints a bridge creates for remote ROS endpoints exist exactly while such remote endpoints are announced.
+// Service and action servers are mirrored as soon as they exist, topic Writers only for remote publishers.
 // A Writer without remote publisher made TRANSIENT_LOCAL subscribers of robot-local topics report an incompatible publisher.
 //
 //   robot bridge (listens) <- operator bridge(s) (connect), one DDS domain each
@@ -123,119 +124,70 @@ async fn topic_writer_follows_remote_publishers() {
     common::close_bridge(robot).await;
 }
 
-/// The server-side request Writer and reply Reader stay while any remote client remains, and leave with the last one.
+/// Operators see a robot service as soon as it exists, so `ros2 service list` and `wait_for_service` work without a prior call.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn service_proxy_follows_remote_clients() {
+async fn service_proxy_follows_remote_server() {
     common::init_env();
-    let (rd, o1, o2, port) = (65, 66, 67, 7902);
+    let (rd, od, port) = (65, 66, 7902);
     let robot = common::create_bridge_with(&robot_bridge_cfg(rd, port)).await;
-    let op1 = common::create_bridge_with(&operator_bridge_cfg(o1, port)).await;
-    let op2 = common::create_bridge_with(&operator_bridge_cfg(o2, port)).await;
-    let probe = DdsProbe::new(rd);
-    let proxy = || (probe.writers("rq/addRequest"), probe.readers("rr/addReply"));
+    let operator = common::create_bridge_with(&operator_bridge_cfg(od, port)).await;
+    let probe = DdsProbe::new(od);
+    let proxy = || (probe.readers("rq/addRequest"), probe.writers("rr/addReply"));
 
     let server = Endpoint::spawn("server", rd, &["server", "/add", "rel", "vol", "10"]).await;
-    tokio::time::sleep(SETTLE).await;
-    assert_eq!(
-        proxy(),
-        (0, 0),
-        "bridge client endpoints without remote client"
-    );
-
-    let client_1 = Endpoint::spawn("client_1", o1, &["client", "/add", "rel", "vol", "10"]).await;
     assert!(
         common::eventually(WAIT, || proxy() == (1, 1)).await,
-        "bridge client endpoints for a remote client: {:?}",
+        "bridge server endpoints for a remote server without local client: {:?}",
         proxy()
     );
     assert_eq!(
-        common::call_service(o1, "/add").await,
+        common::call_service(od, "/add").await,
         "CALLER_GOT_RESPONSE sum=42"
     );
 
-    let client_2 = Endpoint::spawn("client_2", o2, &["client", "/add", "rel", "vol", "10"]).await;
-    tokio::time::sleep(SETTLE).await;
-    client_1.stop().await;
-    tokio::time::sleep(SETTLE).await;
-    assert_eq!(
-        proxy(),
-        (1, 1),
-        "bridge client endpoints while a remote client remains"
-    );
-    assert_eq!(
-        common::call_service(o2, "/add").await,
-        "CALLER_GOT_RESPONSE sum=42"
-    );
-
-    client_2.stop().await;
-    assert!(
-        common::eventually(WAIT, || proxy() == (0, 0)).await,
-        "bridge client endpoints stayed after the last remote client left: {:?}",
-        proxy()
-    );
-
-    let client_3 = Endpoint::spawn("client_3", o1, &["client", "/add", "rel", "vol", "10"]).await;
-    assert!(
-        common::eventually(WAIT, || proxy() == (1, 1)).await,
-        "bridge client endpoints after a remote client returned: {:?}",
-        proxy()
-    );
-    common::close_bridge(op1).await;
-    assert!(
-        common::eventually(WAIT, || proxy() == (0, 0)).await,
-        "bridge client endpoints stayed after the client's bridge left: {:?}",
-        proxy()
-    );
-
-    client_3.stop().await;
     server.stop().await;
-    common::close_bridge(op2).await;
+    assert!(
+        common::eventually(WAIT, || proxy() == (0, 0)).await,
+        "bridge server endpoints stayed after the remote server left: {:?}",
+        proxy()
+    );
+
+    common::close_bridge(operator).await;
     common::close_bridge(robot).await;
 }
 
-/// Action proxies on both sides follow the remote partner, and a ROS action call works through two bridges.
+/// Action proxies appear with the remote action server, and a ROS action call works through two bridges.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn action_proxies_follow_remote_partners() {
+async fn action_proxies_follow_remote_server() {
     common::init_env();
     let (rd, od, port) = (68, 69, 7903);
     let robot = common::create_bridge_with(&robot_bridge_cfg(rd, port)).await;
     let operator = common::create_bridge_with(&operator_bridge_cfg(od, port)).await;
-    let robot_probe = DdsProbe::new(rd);
-    let operator_probe = DdsProbe::new(od);
-    let goal_writers = || robot_probe.writers("rq/fib/_action/send_goalRequest");
-    let feedback_writers = || operator_probe.writers("rt/fib/_action/feedback");
-
-    let client =
-        Endpoint::spawn("client", od, &["action_client", "/fib", "rel", "vol", "10"]).await;
-    tokio::time::sleep(SETTLE).await;
-    assert_eq!(
-        feedback_writers(),
-        0,
-        "bridge feedback Writer without remote action server"
-    );
+    let probe = DdsProbe::new(od);
+    let proxy = || {
+        (
+            probe.readers("rq/fib/_action/send_goalRequest"),
+            probe.writers("rt/fib/_action/feedback"),
+        )
+    };
 
     let server =
         Endpoint::spawn("server", rd, &["action_server", "/fib", "rel", "vol", "10"]).await;
     assert!(
-        common::eventually(WAIT, || goal_writers() == 1 && feedback_writers() == 1).await,
-        "bridge proxies for remote partners: goal writers={} feedback writers={}",
-        goal_writers(),
-        feedback_writers()
+        common::eventually(WAIT, || proxy() == (1, 1)).await,
+        "bridge goal Reader and feedback Writer for a remote action server without local client: {:?}",
+        proxy()
     );
     assert_eq!(
         common::call_action(od, "/fib").await,
         "CALLER_GOT_RESULT sequence=0,1,1,2,3,5 feedback=0,1,1,2,3"
     );
 
-    client.stop().await;
-    assert!(
-        common::eventually(WAIT, || goal_writers() == 0).await,
-        "bridge goal Writer stayed after the last remote action client left"
-    );
     server.stop().await;
     assert!(
-        common::eventually(WAIT, || feedback_writers() == 0).await,
-        "bridge feedback Writer stayed after the remote action server left"
+        common::eventually(WAIT, || proxy() == (0, 0)).await,
+        "bridge action proxies stayed after the remote action server left: {:?}",
+        proxy()
     );
 
     common::close_bridge(operator).await;
